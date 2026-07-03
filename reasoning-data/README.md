@@ -37,4 +37,4 @@ Highly verifiable types feed both levers. Low-verifiability types feed only SFT 
 
 ## Status
 
-Documentation phase. No data generated yet. This repository currently defines the rules, schema, domains, pipeline, and per-type recipes that all future data must obey, and the `data/` tree that defines where datasets will live and the invariants each location enforces.
+Initial dataset available. The docs (rules, schema, domains, pipeline, per-type recipes) are in place, and `data/` holds a first batch of 100 examples per reasoning type (80 train / 20 eval, 900 total) plus 100 paired negatives for the verifiable types. The verifiable types (deductive, inductive, probabilistic, counterfactual, causal) were checked by executing their verifier; the rubric/ranking types (abductive, analogical, moral-ethical) are template-authored with their verification method recorded, awaiting an independent Solver/judge pass.

@@ -1,6 +1,6 @@
 # Data
 
-Where the actual datasets live. This defines the on-disk layout, the lifecycle a record moves through, and the invariants each location enforces. No data exists yet; this specifies where it will go and the rules each folder must hold once it does.
+Where the actual datasets live. This defines the on-disk layout, the lifecycle a record moves through, and the invariants each location enforces. An initial batch of 100 curated examples per reasoning type (80 train / 20 eval, 900 total) plus 100 paired negatives for the verifiable types now populates `data/`.
 
 ## Layout
 
