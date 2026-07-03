@@ -1,6 +1,6 @@
 # Data
 
-Where the actual datasets live. This defines the on-disk layout, the lifecycle a record moves through, and the invariants each location enforces. An initial batch of 100 curated examples per reasoning type (80 train / 20 eval, 900 total) plus 100 paired negatives for the verifiable types now populates `data/`.
+Where the actual datasets live. This defines the on-disk layout, the lifecycle a record moves through, and the invariants each location enforces. The current corpus holds 300 curated examples per reasoning type (240 train / 60 eval, 2,700 total) plus 300 paired negatives for the verifiable types, spanning many domains and several question formats per type.
 
 ## Layout
 
