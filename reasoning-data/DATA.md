@@ -34,6 +34,15 @@ A record moves left to right through the pipeline (PIPELINE.md):
 - **seeds/** — hand-written; `provenance.source` records this, and items generated from a seed reference it via `provenance.seed_id`.
 - Every record in every location conforms to SCHEMA.md. A record's location changes its training eligibility, never its schema.
 
+## Tooling
+
+Batches are produced by `tools/generate.py`, a reusable generator that emits new
+traces (default 500 per type), verifies the verifiable types by executing their
+verifier, dedups against what is already on disk, continues IDs, and appends here.
+It is safe by default (dry run unless `--write`) and reports achievable counts per
+type rather than padding a shortfall. See `tools/README.md`. Change `--seed` for a
+new season; extend the marked banks to grow the authored types.
+
 ## Decontamination and derived data
 
 Decontamination audits run against all evaluation sets before any batch is promoted to curated, and again after any synthesis step (RULES.md, Rule 1). Decontamination hashes, token counts, and chat-template formatting are computed by tooling at audit or training time and are never written into these files (SCHEMA.md).
