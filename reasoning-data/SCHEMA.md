@@ -10,7 +10,7 @@ Data is stored as **JSONL**: one record per line, one file per reasoning type pe
 | --- | --- | --- | --- |
 | id | string | yes | `{type-prefix}-{6 digits}`, e.g. `ded-000123`. Prefixes: ded, ind, abd, ana, cau, cfa, prb, met, mor. Negative traces append `-neg`. Example: `ded-000123` |
 | reasoning_type | enum | yes | one of: deductive, inductive, abductive, analogical, causal, counterfactual, probabilistic, metacognitive, moral-ethical. Example: `deductive` |
-| domain | string | yes | must match a domain listed in DOMAINS.md. Example: `logic puzzles` |
+| domain | string | yes | must match a canonical domain name in DOMAINS.md verbatim (lowercase, case-sensitive). Example: `logic puzzles` |
 | problem | string | yes | fully self-contained problem statement including all facts, constraints, and rules needed to solve it; no external references. Example: `Every A is B. Every B is C. Is every A a C?` |
 | reasoning_trace | array | yes | ordered steps, each `{"step": int, "text": string, "label": "valid" \| "invalid" \| "unverified"}`. Self-checks and considered alternatives appear as ordinary steps. Example: `[{"step":1,"text":"...","label":"valid"}]` |
 | final_answer | string | yes | the concluding answer only, no reasoning. Example: `Yes` |
@@ -82,7 +82,7 @@ Data is stored as **JSONL**: one record per line, one file per reasoning type pe
 - Moral-ethical records must use `rubric_judge` as the verification method.
 - Steps in `reasoning_trace` must be numbered consecutively starting from 1, with no gaps or repeats.
 - `id` must carry the correct type prefix; negative traces must end in `-neg`.
-- `domain` must be one of the domains listed in DOMAINS.md.
+- `domain` must exactly match (case-sensitive) one of the canonical bolded domain names in DOMAINS.md.
 
 ## A note on splits
 
