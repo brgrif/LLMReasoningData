@@ -31,8 +31,10 @@ Highly verifiable types feed both levers. Low-verifiability types feed only SFT 
 - **PIPELINE.md** — how data is generated and filtered at scale: the Propose-Verify-Mutate pipeline, the deterministic gates, and the supplementary human-sourced inputs.
 - **TRAINING.md** — how the data is consumed: SFT and distillation first, the anti-collapse mixing rule, RLVR for verifiable types, and preference optimization from negatives.
 - **ROADMAP.md** — reasoning types deliberately deferred until the core nine prove out, each waiting on a verifier that does not yet exist, plus the promotion criterion.
+- **DATA.md** — the on-disk dataset layout: where seeds, raw candidates, curated positives, and the negatives pool live, and the invariants each location enforces.
 - **reasoning-types/** — one file per reasoning type, each a self-contained recipe (definition, canonical example, what good data looks like, verification method, difficulty ladder, traps, and a sample record).
+- **data/** — the datasets themselves, one file per type per split, organized into `seeds/`, `raw/`, `curated/`, and `negatives/` (currently empty; see DATA.md).
 
 ## Status
 
-Documentation phase. No data generated yet. This repository currently defines the rules, schema, domains, pipeline, and per-type recipes that all future data must obey.
+Documentation phase. No data generated yet. This repository currently defines the rules, schema, domains, pipeline, and per-type recipes that all future data must obey, and the `data/` tree that defines where datasets will live and the invariants each location enforces.

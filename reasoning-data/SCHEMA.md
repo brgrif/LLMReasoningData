@@ -86,7 +86,7 @@ Data is stored as **JSONL**: one record per line, one file per reasoning type pe
 
 ## A note on splits
 
-Train and held-out eval live in separate files (`{type}.train.jsonl` and `{type}.eval.jsonl`). Eval problems are never used as seeds for generation. Keeping the split at the file level makes decontamination and leakage audits mechanical.
+Train and held-out eval live in separate files (`{type}.train.jsonl` and `{type}.eval.jsonl`) under `data/curated/`. Eval problems are never used as seeds for generation. Keeping the split at the file level makes decontamination and leakage audits mechanical. See DATA.md for the full on-disk layout (seeds, raw, curated, negatives) and the invariants each location enforces.
 
 ## A note on derived data
 
