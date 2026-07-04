@@ -6,15 +6,21 @@ Current contents (train / eval / paired negatives):
 
 | type | train | eval | negatives |
 | --- | --- | --- | --- |
-| deductive | 6,000 | 120 | 1,500 |
-| inductive | 5,000 | 86 | 1,250 |
-| probabilistic | 5,000 | 110 | 1,250 |
-| counterfactual | 5,000 | 92 | 1,250 |
-| causal | 5,000 | 102 | 1,249 |
-| analogical | 6,000 | 548 | -- |
-| metacognitive | 3,000 | 82 | -- |
-| abductive | 2,500 | 68 | -- |
-| moral-ethical | 2,000 | 128 | -- |
+| deductive | 10,000 | 120 | 2,500 |
+| inductive | 10,000 | 86 | 2,500 |
+| probabilistic | 10,000 | 110 | 2,500 |
+| counterfactual | 10,000 | 92 | 2,500 |
+| causal | 10,000 | 102 | 2,499 |
+| analogical | 10,000 | 548 | -- |
+| metacognitive | 10,000 | 82 | -- |
+| abductive | 10,000 | 84 | -- |
+| moral-ethical | 5,500 | 240 | -- |
+
+Eight types scale to 10,000 train by appending seasons (parametric volume);
+**moral-ethical is bank-bound** (its ceiling is dilemmas x analysis modes) and
+holds 5,500 -- extended honestly with 15 genuine analysis lenses over ~400
+dilemmas rather than padded to 10,000 with near-duplicate answers (RULES.md
+forbids padding). Every moral train item has a distinct trace and final.
 
 **All nine types are now seed-driven with a deterministic, held-out eval** (not just analogical). Each `build_<type>` emits a fixed benchmark drawn from a *reserved* parameter/entity region (disjoint from train) plus a parametric/bank train layer, so: train and eval never share a problem; the (structural-signature, final_answer) leakage between them is zero (analogical: 1-2, coincidence); and the eval is identical every season (it saturates on append while train grows). Difficulty spans 1-5 for every type (moral-ethical spans 2-5: it has no trivial dilemmas). Every record is `generation_method: procedural` with an honest `provenance.source` -- nothing is labeled `human_expert`/`hand-authored`, because the whole corpus is produced by `tools/generate.py`. The verifiable types (deductive, inductive, probabilistic, counterfactual, causal) are checked by executing their verifier in Python and only passing items are emitted; analogical/abductive/metacognitive/moral-ethical carry their verification method (process_check / answer_match / rubric_judge) by construction and await an independent Solver/judge pass.
 
