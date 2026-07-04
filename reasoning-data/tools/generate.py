@@ -726,44 +726,98 @@ ANA_REL = [
      [("triangle","180"),("quadrilateral","360"),("pentagon","540"),("hexagon","720"),("heptagon","900"),("octagon","1080"),("nonagon","1260"),("decagon","1440")]),
     ("device to the energy conversion it performs", "device", "energy conversion", "engineering and physical systems", 3, True,
      [("motor","electrical to mechanical"),("generator","mechanical to electrical"),("battery","chemical to electrical"),("solar cell","light to electrical"),("microphone","sound to electrical"),("speaker","electrical to sound"),("heater","electrical to thermal"),("turbine","kinetic to mechanical")]),
+    # --- additional train relations (breadth) ---
+    ("tree to its fruit", "tree", "fruit", "biology and ecology", 1, False,
+     [("apple tree","apple"),("orange tree","orange"),("oak","acorn"),("vine","grape"),("olive tree","olive"),("cherry tree","cherry"),("fig tree","fig"),("almond tree","almond"),("peach tree","peach"),("lemon tree","lemon"),("coconut palm","coconut"),("chestnut tree","chestnut")]),
+    ("liquid to its frozen form", "liquid", "frozen form", "science", 2, False,
+     [("water","ice"),("lava","rock"),("candle wax","solid wax"),("milk","milk ice"),("molten glass","glass"),("mercury","solid mercury"),("juice","popsicle"),("cream","ice cream"),("honey","crystallized honey"),("steel","ingot")]),
+    ("worker to their finished product", "maker", "product", "economics and markets", 2, False,
+     [("carpenter","furniture"),("chef","meal"),("architect","building"),("composer","symphony"),("programmer","software"),("farmer","crop"),("sculptor","statue"),("playwright","play"),("tailor","garment"),("engineer","machine"),("baker","loaf"),("brewer","ale")]),
+    ("celestial body to what orbits it", "body", "satellite", "science", 3, False,
+     [("Earth","the Moon"),("the Sun","the planets"),("Jupiter","its moons"),("a nucleus","electrons"),("a galaxy","its stars"),("Mars","Phobos"),("Saturn","its rings"),("a planet","its atmosphere")]),
+    ("action to the sense it uses", "action", "sense", "biology and ecology", 1, False,
+     [("seeing","sight"),("hearing","hearing"),("tasting","taste"),("smelling","smell"),("touching","touch"),("reading","sight"),("listening","hearing"),("sniffing","smell")]),
+    ("material to the craft that shapes it", "material", "craft", "engineering and physical systems", 2, False,
+     [("clay","pottery"),("wood","carpentry"),("metal","smithing"),("glass","glassblowing"),("stone","masonry"),("cloth","tailoring"),("leather","tanning"),("gold","goldsmithing"),("paper","origami"),("wax","candlemaking")]),
+    ("emotion to its facial sign", "emotion", "facial sign", "social situations", 2, False,
+     [("happiness","a smile"),("sadness","a frown"),("surprise","raised brows"),("anger","a scowl"),("fear","wide eyes"),("disgust","a wrinkled nose"),("boredom","a yawn"),("confusion","a furrowed brow")]),
+    ("disease to the organ it attacks", "disease", "organ", "medicine-style diagnosis", 3, False,
+     [("hepatitis","the liver"),("nephritis","the kidney"),("pneumonia","the lungs"),("gastritis","the stomach"),("arthritis","the joints"),("meningitis","the brain lining"),("carditis","the heart"),("dermatitis","the skin")]),
+    ("operation to its inverse", "operation", "inverse", "mathematics", 2, False,
+     [("addition","subtraction"),("multiplication","division"),("squaring","square root"),("exponentiation","logarithm"),("differentiation","integration"),("encryption","decryption"),("folding","unfolding"),("freezing","melting")]),
+    ("tool to the quantity it measures", "instrument", "quantity", "science", 2, False,
+     [("thermometer","temperature"),("barometer","pressure"),("odometer","distance"),("voltmeter","voltage"),("scale","weight"),("clock","time"),("hygrometer","humidity"),("seismometer","ground motion"),("ammeter","current"),("speedometer","speed")]),
 ]
 
+# Verbiage diversity: a large deck of problem phrasings. Each analogy is emitted
+# once with ONE sampled phrasing (surface variety without duplicating answers).
 Q_ANA_TRAIN = [
     "{demo}. Each pair shares one relation: {rel}. By the same relation, complete: {t0} : ?",
     "Relation held constant ({rel}): {demo}. What completes the pair {t0} : ?",
     "In every pair {aleft} maps to its {right} ({demo}). Give the {right} for {t0}.",
+    "Study the pairs {demo}. They all follow the relation '{rel}'. Now do {t0} : ?",
+    "Pattern ({rel}): {demo}. Extend it: {t0} -> ?",
+    "Here {aleft} is paired with its {right}: {demo}. What should pair with {t0}?",
+    "Each of these maps a {left} to its {right}: {demo}. Fill in {t0} -> ?",
+    "Following the single relation '{rel}' shown by {demo}, complete {t0} -> ?",
+    "The examples {demo} share one rule ({rel}). Apply that rule to {t0}.",
+    "Analogy: as in {demo} ({rel}), give the match for {t0}.",
+    "Work out the {right} of {t0}, using the relation '{rel}' from {demo}.",
+    "{demo}: one relation runs through all of these ({rel}). What completes {t0} : ?",
 ]
 Q_ANA_EVAL = [
     "These pairs share exactly one relation ({rel}): {demo}. Supply the term for {t0}.",
-    "Given the relation {rel} shown by {demo}, what pairs with {t0}?",
 ]
 
-def _simple_items(rel, left, right, dom, diff, targets, pool, phrasings, split, seen):
-    """One item per target (no per-item phrasing duplication); the phrasing
-    rotates across targets so the dataset keeps format variety without emitting
-    the same analogy three times."""
-    out = []
-    for ti, (t0, ans) in enumerate(targets):
-        others = [(a, b) for (a, b) in pool if a != t0][:3]
-        if len(others) < 3:
-            continue
-        demo = "; ".join(f"{a} -> {b}" for a, b in others)
-        d1, d2, d3 = others
-        steps = [
-            (f"Relation being transferred: {_art(left)} maps to its {right}. Demonstrated by {d1[0]} -> {d1[1]}, {d2[0]} -> {d2[1]}, {d3[0]} -> {d3[1]}.", "valid"),
-            (f"Hold that relation fixed and change only the {left}: apply it to '{t0}'.", "valid"),
-            (f"The {right} of {t0} is {ans}.", "valid"),
-            (f"Check: the demonstrations and '{t0}' share the relation but differ in surface content, so the structure -- not word overlap -- fixes the answer as {ans}.", "valid"),
-        ]
-        tmpl = phrasings[ti % len(phrasings)]
+# REGISTER deck: content-preserving voices/framings applied once per TRAIN item
+# for verbiage diversity. Eval items stay in the plain register (stable
+# benchmark). Each entry transforms the problem string without altering content.
+def _reg_plain(p): return p
+def _reg_memo(p): return "MEMO -- reasoning drill.\n" + p
+def _reg_consider(p): return "Consider the following. " + p
+def _reg_q(p): return "Q. " + p
+def _reg_puzzle(p): return "A little puzzle: " + p
+def _reg_colleague(p): return "A colleague asks: " + p
+def _reg_exam(p): return "Exam item. " + p
+def _reg_warmup(p): return "Warm-up. " + p
+def _reg_fieldnote(p): return "[field notebook] " + p
+def _reg_challenge(p): return "Analogy challenge -- " + p
+def _reg_stepwise(p): return p + "\nReason it through step by step before answering."
+def _reg_briefly(p): return p + " (Explain the mapping, then give the answer.)"
+def _reg_ticket(p): return "TICKET #-- please resolve: " + p
+def _reg_socratic(p): return "Let's reason together. " + p
+REGISTERS = [_reg_plain, _reg_memo, _reg_consider, _reg_q, _reg_puzzle, _reg_colleague,
+             _reg_exam, _reg_warmup, _reg_fieldnote, _reg_challenge, _reg_stepwise,
+             _reg_briefly, _reg_ticket, _reg_socratic]
+
+def _register(rng, text):
+    return rng.choice(REGISTERS)(text)
+
+def _mk_simple(rel, left, right, dom, diff, t0, ans, others, tmpl, split, prob=None):
+    """Construct one single-relation item (caller supplies demos and phrasing)."""
+    d1, d2, d3 = others
+    demo = "; ".join(f"{a} -> {b}" for a, b in others)
+    steps = [
+        (f"Relation being transferred: {_art(left)} maps to its {right}. Demonstrated by {d1[0]} -> {d1[1]}, {d2[0]} -> {d2[1]}, {d3[0]} -> {d3[1]}.", "valid"),
+        (f"Hold that relation fixed and change only the {left}: apply it to '{t0}'.", "valid"),
+        (f"The {right} of {t0} is {ans}.", "valid"),
+        (f"Check: the demonstrations and '{t0}' share the relation but differ in surface content, so the structure -- not word overlap -- fixes the answer as {ans}.", "valid"),
+    ]
+    if prob is None:
         prob = tmpl.format(demo=demo, rel=rel, t0=t0, left=left, right=right, aleft=_art(left))
-        if prob in seen:
-            continue
-        seen.add(prob)
-        out.append(dict(domain=dom, problem=prob, steps=steps, final=cap(str(ans)) + ".",
-                        difficulty=diff, vm="process_check", split=split,
-                        vd=f"Answer fills the '{right}' role of the '{rel}' relation for '{t0}'; mapping shown across the demonstrations, surface content varied."))
-    return out
+    return dict(domain=dom, problem=prob, steps=steps, final=cap(str(ans)) + ".",
+                difficulty=diff, vm="process_check", split=split,
+                vd=f"Answer fills the '{right}' role of the '{rel}' relation for '{t0}'; mapping shown across the demonstrations, surface content varied.")
+
+def _simple_pools(rel_tuple):
+    """Return (train_pairs, eval_pairs) for a relation with disjoint answers."""
+    relphrase, left, right, dom, diff, eval_only, pairs = rel_tuple
+    if eval_only:
+        return [], list(pairs)
+    eval_pairs = pairs[-4:]
+    eval_ans = {b for _, b in eval_pairs}
+    train_pairs = [(a, b) for (a, b) in pairs[:-4] if b not in eval_ans]
+    return train_pairs, eval_pairs
 
 # ---- difficulty-4/5 trap kernels ----------------------------------------
 # T1: series flow blockage with a local-damage surface distractor.
@@ -787,43 +841,36 @@ T1_SKINS = [
     ("a supply chain leg", "goods", "hub", ["Port","Depot","Store"], "checkpoint", "closed",
      "the port's signage is outdated", "outdated signage", "finance and business operations"),
 ]
-def _t1_items(skins, split, seen):
-    out = []
-    for sys_, medium, stage, nodes, conn, fail, distr, distr_lbl, dom in skins:
-        n1, n2, n3 = nodes
-        for bi in (0, 1):  # blockage after node bi; stages after it lose supply
-            blocked = nodes[bi]
-            downstream = nodes[bi + 1:]
-            upstream = nodes[:bi + 1]
-            ds = ", ".join(downstream)
-            us = ", ".join(upstream)
-            # subject-verb agreement: singular when the list names one stage
-            us_sit, us_keep, us_stay = ("sits", "keeps", "stays") if len(upstream) == 1 else ("sit", "keep", "stay")
-            ds_lie, ds_lose = ("lies", "loses") if len(downstream) == 1 else ("lie", "lose")
-            prob = (f"Reference relation: in a chain where {medium} flows in series, "
-                    f"if one link is blocked, everything downstream of the block loses supply while everything upstream keeps it. "
-                    f"Present case: {sys_} carries {medium} in series through {n1}, then {n2}, then {n3}; "
-                    f"the {conn} at {blocked} has {fail}. Note also that {distr}. "
-                    f"By the same relation, which element plays the blocked-link role, and which {_plural(stage)} lose {medium}? "
-                    f"(One observation is a surface look-alike; decide by role, not appearance.)")
-            steps = [
-                (f"Relational template: {medium} flows in series through a chain; a single point-block cuts off everything downstream of it while upstream stages are unaffected.", "valid"),
-                (f"Map roles: the series chain -> {n1}, then {n2}, then {n3}; the blocked link (the thing that stops onward flow) -> {_art(conn)} that has failed.", "valid"),
-                (f"Locate the block in the target: the {conn} at {blocked} has {fail}, so it fills the blocked-link role.", "valid"),
-                (f"Propagate along the structure: {us} {us_sit} at or before the block and {us_keep} {medium}; {ds} {ds_lie} downstream of it and {ds_lose} {medium}.", "valid"),
-                (f"Reject the surface distractor: '{distr}' resembles damage, but the template concerns flow blockage, not local cosmetic harm, so it does not fill the blocked-link role.", "valid"),
-                (f"Check: the mapping preserves the relation (a point-block cuts downstream flow); the answer follows from the series structure, not from surface resemblance.", "valid"),
-            ]
-            final = (f"The {conn} at {blocked} plays the blocked-link role; {ds} {ds_lose} {medium} while {us} {us_stay} supplied. "
-                     f"The {distr_lbl} is a surface look-alike, not the blockage.")
-            prob_key = prob
-            if prob_key in seen:
-                continue
-            seen.add(prob_key)
-            out.append(dict(domain=dom, problem=prob, steps=steps, final=final, difficulty=4,
-                            vm="process_check", split=split,
-                            vd="Answer fills the blocked-link role by the series-flow structure; the cosmetic observation is rejected as a surface look-alike."))
-    return out
+def _mk_t1(skin, bi, split):
+    """Construct one series-blockage item; bi is the blocked node index (0 or 1)."""
+    sys_, medium, stage, nodes, conn, fail, distr, distr_lbl, dom = skin
+    n1, n2, n3 = nodes
+    blocked = nodes[bi]
+    downstream = nodes[bi + 1:]
+    upstream = nodes[:bi + 1]
+    ds = ", ".join(downstream)
+    us = ", ".join(upstream)
+    us_sit, us_keep, us_stay = ("sits", "keeps", "stays") if len(upstream) == 1 else ("sit", "keep", "stay")
+    ds_lie, ds_lose = ("lies", "loses") if len(downstream) == 1 else ("lie", "lose")
+    prob = (f"Reference relation: in a chain where {medium} flows in series, "
+            f"if one link is blocked, everything downstream of the block loses supply while everything upstream keeps it. "
+            f"Present case: {sys_} carries {medium} in series through {n1}, then {n2}, then {n3}; "
+            f"the {conn} at {blocked} has {fail}. Note also that {distr}. "
+            f"By the same relation, which element plays the blocked-link role, and which {_plural(stage)} lose {medium}? "
+            f"(One observation is a surface look-alike; decide by role, not appearance.)")
+    steps = [
+        (f"Relational template: {medium} flows in series through a chain; a single point-block cuts off everything downstream of it while upstream stages are unaffected.", "valid"),
+        (f"Map roles: the series chain -> {n1}, then {n2}, then {n3}; the blocked link (the thing that stops onward flow) -> {_art(conn)} that has failed.", "valid"),
+        (f"Locate the block in the target: the {conn} at {blocked} has {fail}, so it fills the blocked-link role.", "valid"),
+        (f"Propagate along the structure: {us} {us_sit} at or before the block and {us_keep} {medium}; {ds} {ds_lie} downstream of it and {ds_lose} {medium}.", "valid"),
+        (f"Reject the surface distractor: '{distr}' resembles damage, but the template concerns flow blockage, not local cosmetic harm, so it does not fill the blocked-link role.", "valid"),
+        (f"Check: the mapping preserves the relation (a point-block cuts downstream flow); the answer follows from the series structure, not from surface resemblance.", "valid"),
+    ]
+    final = (f"The {conn} at {blocked} plays the blocked-link role; {ds} {ds_lose} {medium} while {us} {us_stay} supplied. "
+             f"The {distr_lbl} is a surface look-alike, not the blockage.")
+    return dict(domain=dom, problem=prob, steps=steps, final=final, difficulty=4,
+                vm="process_check", split=split,
+                vd="Answer fills the blocked-link role by the series-flow structure; the cosmetic observation is rejected as a surface look-alike.")
 
 # T2: binding constraint = min(stock / per-unit need), NOT min(stock).
 # (domain, register, item-noun, [r1,r2,r3], unit)
@@ -835,15 +882,6 @@ T2_SKINS = [
     ("economics and markets", "a bakery", "cake", ["flour", "eggs", "sugar"], "grams"),
     ("chemistry", "a lab prep", "batch", ["reagent A", "reagent B", "reagent C"], "mL"),
 ]
-# (stocks, rates) chosen so argmin(stock/rate) != argmin(stock); verified below.
-T2_NUMS = [
-    ((60, 24, 90), (4, 2, 9)),
-    ((100, 30, 80), (5, 2, 8)),
-    ((120, 40, 75), (6, 3, 15)),
-    ((48, 20, 66), (4, 2, 11)),
-    ((90, 36, 84), (5, 3, 14)),
-    ((72, 28, 96), (4, 2, 12)),
-]
 def _plural(noun):
     """English plural for the simple item nouns used here."""
     if noun.endswith(("s", "x", "ch", "sh")):
@@ -852,41 +890,46 @@ def _plural(noun):
         return noun[:-1] + "ies"
     return noun + "s"
 
-def _t2_items(skins, nums, split, seen):
-    out = []
-    for dom, reg, item, res, unit in skins:
-        items = _plural(item)
-        for stocks, rates in nums:
-            caps = [s // r for s, r in zip(stocks, rates)]
-            binding = min(range(3), key=lambda i: stocks[i] / rates[i])
-            raw_min = min(range(3), key=lambda i: stocks[i])
-            if binding == raw_min:
-                continue  # the trap requires the two readings to disagree
-            mincount = caps[binding]
-            r1, r2, r3 = res
-            s1, s2, s3 = stocks
-            q1, q2, q3 = rates
-            prob = (f"Rule for {reg}: the number of {items} you can complete is set by the resource with the smallest "
-                    f"stock-divided-by-per-{item} need -- which is frequently NOT the one you have least of overall. "
-                    f"Apply that same relation here. Each {item} needs {q1} {unit} of {r1}, {q2} of {r2}, and {q3} of {r3}; "
-                    f"in stock you have {s1} {unit} of {r1}, {s2} of {r2}, and {s3} of {r3}. "
-                    f"Which resource runs out first (caps the count), and how many {items} do you get? "
-                    f"(The resource you have least of by raw amount is a distractor.)")
-            steps = [
-                (f"Relation to transfer: the binding resource minimizes stock / per-{item} need, not raw stock.", "valid"),
-                (f"Compute the supported count for each: {r1} = {s1}/{q1} = {caps[0]}; {r2} = {s2}/{q2} = {caps[1]}; {r3} = {s3}/{q3} = {caps[2]} {items}.", "valid"),
-                (f"Name the distractor: by raw amount the scarcest is {res[raw_min]} ({stocks[raw_min]} {unit}), which the surface reading would wrongly pick.", "valid"),
-                (f"By the intended relation the minimum supported count is {mincount}, at {res[binding]}, even though its raw stock ({stocks[binding]}) is not the smallest.", "valid"),
-                (f"Check: {mincount} {items} consume {mincount*q1} of {r1} (<= {s1}), {mincount*q2} of {r2} (<= {s2}), {mincount*q3} of {r3} (<= {s3}); one more would need {(mincount+1)*rates[binding]} of {res[binding]}, exceeding {stocks[binding]}. Mapping confirmed.", "valid"),
-            ]
-            final = f"{cap(res[binding])} runs out first; you can complete {mincount} {items}."
-            if prob in seen:
-                continue
-            seen.add(prob)
-            out.append(dict(domain=dom, problem=prob, steps=steps, final=final, difficulty=5,
-                            vm="process_check", split=split,
-                            vd=f"Binding constraint recomputed: min(stock/need) = {mincount} at {res[binding]}; the raw-scarcest resource {res[raw_min]} is correctly rejected as a distractor."))
-    return out
+def _rand_t2_nums(rng):
+    """Random (stocks, rates) where the binding resource (min stock/rate) is NOT
+    the raw-scarcest (min stock) -- the trap. Verified before returning."""
+    for _ in range(40):
+        rates = [rng.randint(2, 12) for _ in range(3)]
+        caps = [rng.randint(4, 20) for _ in range(3)]      # supported counts
+        stocks = [c * r + rng.randint(0, r - 1) for c, r in zip(caps, rates)]  # stock >= cap*rate
+        binding = min(range(3), key=lambda i: stocks[i] / rates[i])
+        raw_min = min(range(3), key=lambda i: stocks[i])
+        caps = [s // r for s, r in zip(stocks, rates)]
+        if binding != raw_min and len({caps[binding]}) and caps[binding] == min(caps) \
+           and sum(1 for c in caps if c == min(caps)) == 1:
+            return stocks, rates
+    return None
+
+def _mk_t2(skin, stocks, rates, split):
+    dom, reg, item, res, unit = skin
+    items = _plural(item)
+    caps = [s // r for s, r in zip(stocks, rates)]
+    binding = min(range(3), key=lambda i: stocks[i] / rates[i])
+    raw_min = min(range(3), key=lambda i: stocks[i])
+    mincount = caps[binding]
+    r1, r2, r3 = res; s1, s2, s3 = stocks; q1, q2, q3 = rates
+    prob = (f"Rule for {reg}: the number of {items} you can complete is set by the resource with the smallest "
+            f"stock-divided-by-per-{item} need -- which is frequently NOT the one you have least of overall. "
+            f"Apply that same relation here. Each {item} needs {q1} {unit} of {r1}, {q2} of {r2}, and {q3} of {r3}; "
+            f"in stock you have {s1} {unit} of {r1}, {s2} of {r2}, and {s3} of {r3}. "
+            f"Which resource runs out first (caps the count), and how many {items} do you get? "
+            f"(The resource you have least of by raw amount is a distractor.)")
+    steps = [
+        (f"Relation to transfer: the binding resource minimizes stock / per-{item} need, not raw stock.", "valid"),
+        (f"Compute the supported count for each: {r1} = {s1}/{q1} = {caps[0]}; {r2} = {s2}/{q2} = {caps[1]}; {r3} = {s3}/{q3} = {caps[2]} {items}.", "valid"),
+        (f"Name the distractor: by raw amount the scarcest is {res[raw_min]} ({stocks[raw_min]} {unit}), which the surface reading would wrongly pick.", "valid"),
+        (f"By the intended relation the minimum supported count is {mincount}, at {res[binding]}, even though its raw stock ({stocks[binding]}) is not the smallest.", "valid"),
+        (f"Check: {mincount} {items} consume {mincount*q1} of {r1} (<= {s1}), {mincount*q2} of {r2} (<= {s2}), {mincount*q3} of {r3} (<= {s3}); one more would need {(mincount+1)*rates[binding]} of {res[binding]}, exceeding {stocks[binding]}. Mapping confirmed.", "valid"),
+    ]
+    final = f"{cap(res[binding])} runs out first; you can complete {mincount} {items}."
+    return dict(domain=dom, problem=prob, steps=steps, final=final, difficulty=5,
+                vm="process_check", split=split,
+                vd=f"Binding constraint recomputed: min(stock/need) = {mincount} at {res[binding]}; the raw-scarcest resource {res[raw_min]} is correctly rejected as a distractor.")
 
 # T3: exception-to-the-exception reinstates the base rule; a relabeled item is
 # a surface distractor that stays in the plain-exception role.
@@ -900,76 +943,78 @@ T3_SKINS = [
     ("law and regulation", "building", "subject to the noise ordinance", "place of worship", "hosting a ticketed concert", "repainted a different colour"),
     ("biology and ecology", "cell", "flagged for apoptosis", "stem cell", "showing DNA damage", "relocated to another tissue"),
 ]
-def _t3_items(skins, split, seen):
-    out = []
-    for dom, alln, base, exempt, reinstate, distr in skins:
-        prob = (f"Structural rule (three levels): every {alln} is {base}; {_art(exempt)} is an exception and is NOT {base}; "
-                f"but {_art(exempt)} that is {reinstate} is {base} again -- the base outcome is reinstated at the third level. "
-                f"Careful: some {exempt}s are merely {distr}, which superficially looks like the reinstated case but is not. "
-                f"By the same three-level relation, which class of {alln} has the base outcome ({base}) reinstated?")
-        steps = [
-            (f"Relational template: a base rule R applies to all items; an exception E suspends R for a subclass; an exception-to-E reinstates R for a sub-subclass.", "valid"),
-            (f"Map the levels: R = '{base}' (all {alln}s); E = {exempt}s (R suspended); the role to fill is the sub-subclass where R returns.", "valid"),
-            (f"The sub-subclass whose base outcome returns is {exempt}s that are {reinstate}: they are {base} again.", "valid"),
-            (f"Reject the distractor: {exempt}s that are merely {distr} still are NOT {base}; being relabeled or moved does not reinstate R, so they occupy role E, not the exception-to-E role.", "valid"),
-            (f"Check: the answer fills the exact third-level role (base outcome reinstated); the relation matches even though the vocabulary differs from the source.", "valid"),
-        ]
-        final = f"The {exempt}s that are {reinstate} -- they have the base outcome ({base}) reinstated."
-        if prob in seen:
-            continue
-        seen.add(prob)
-        out.append(dict(domain=dom, problem=prob, steps=steps, final=final, difficulty=4,
-                        vm="process_check", split=split,
-                        vd="Answer fills the exception-to-exception role; the merely-relabeled subclass is rejected as a surface distractor that remains in role E."))
-    return out
+def _mk_t3(skin, split):
+    dom, alln, base, exempt, reinstate, distr = skin
+    prob = (f"Structural rule (three levels): every {alln} is {base}; {_art(exempt)} is an exception and is NOT {base}; "
+            f"but {_art(exempt)} that is {reinstate} is {base} again -- the base outcome is reinstated at the third level. "
+            f"Careful: some {exempt}s are merely {distr}, which superficially looks like the reinstated case but is not. "
+            f"By the same three-level relation, which class of {alln} has the base outcome ({base}) reinstated?")
+    steps = [
+        (f"Relational template: a base rule R applies to all items; an exception E suspends R for a subclass; an exception-to-E reinstates R for a sub-subclass.", "valid"),
+        (f"Map the levels: R = '{base}' (all {alln}s); E = {exempt}s (R suspended); the role to fill is the sub-subclass where R returns.", "valid"),
+        (f"The sub-subclass whose base outcome returns is {exempt}s that are {reinstate}: they are {base} again.", "valid"),
+        (f"Reject the distractor: {exempt}s that are merely {distr} still are NOT {base}; being relabeled or moved does not reinstate R, so they occupy role E, not the exception-to-E role.", "valid"),
+        (f"Check: the answer fills the exact third-level role (base outcome reinstated); the relation matches even though the vocabulary differs from the source.", "valid"),
+    ]
+    final = f"The {exempt}s that are {reinstate} -- they have the base outcome ({base}) reinstated."
+    return dict(domain=dom, problem=prob, steps=steps, final=final, difficulty=4,
+                vm="process_check", split=split,
+                vd="Answer fills the exception-to-exception role; the merely-relabeled subclass is rejected as a surface distractor that remains in role E.")
 
-# T4: competing relations -- two rules each fit the first pair, only one fits
-# ALL pairs; transfer the consistent one. Numerically verified.
-# (label, true op, competitor op, competitor-name)
+# T4: competing relations -- two rules each fit the FIRST shown pair, only one
+# fits ALL pairs; transfer the consistent one. Parametric + numerically verified.
 def _sq(n): return n * n
 def _cube(n): return n * n * n
 def _dbl(n): return 2 * n
 def _tpl(n): return 3 * n
-def _tri(n): return n * (n + 1) // 2  # triangular number
-T4_OPS = [
-    ("each number maps to its square", _sq, "tripling", _tpl, [3, 4, 5, 6], 7, "mathematics"),
-    ("each number maps to its square", _sq, "doubling", _dbl, [2, 3, 4, 5], 6, "mathematics"),
-    ("each number maps to its cube", _cube, "squaring", _sq, [2, 3, 4], 5, "mathematics"),
-    ("each number maps to the sum 1..n", _tri, "doubling", _dbl, [2, 3, 4, 5], 6, "mathematics"),
-    ("each input maps to its square (units produced)", _sq, "tripling", _tpl, [4, 5, 6], 8, "economics and markets"),
-    ("each reading maps to its cube", _cube, "doubling", _dbl, [2, 3, 4], 6, "science"),
+def _tri(n): return n * (n + 1) // 2  # running total 1..n
+# (op, op-label, competitor, competitor-name, crossing x0 where op(x0)==comp(x0))
+T4_PAIRS = [
+    (_sq, "each number maps to its square", _tpl, "tripling", 3),
+    (_sq, "each number maps to its square", _dbl, "doubling", 2),
+    (_sq, "each number maps to its square", (lambda n: n + 2), "adding 2", 2),
+    (_dbl, "each number maps to its double", (lambda n: n + 3), "adding 3", 3),
+    (_tri, "each number maps to the running total 1..n", _dbl, "doubling", 3),
+    (_cube, "each number maps to its cube", (lambda n: 7 * n - 6), "the rule 7n-6", 1),
 ]
-def _t4_items(ops, split, seen):
-    out = []
-    for label, op, comp_name, comp, xs, tx, dom in ops:
-        # keep only demos where the true op is single-valued and the competitor
-        # agrees on the FIRST demo but diverges on a later one (a real competitor)
-        if op(xs[0]) != comp(xs[0]):
+T4_DOMAINS = ["mathematics", "science", "economics and markets", "program behavior", "algorithms and program analysis"]
+
+def _rand_t4(rng):
+    """Random competing-relations spec: (op,label,comp,comp_name,xs,tx,dom).
+    x0 (the crossing point) is shown first so the competitor fits the first pair;
+    the other shown x's diverge, exposing the competitor as wrong."""
+    for _ in range(30):
+        op, label, comp, cname, x0 = rng.choice(T4_PAIRS)
+        pool = [x for x in range(2, 13) if x != x0 and op(x) != comp(x)]
+        if len(pool) < 3:
             continue
-        if not any(op(x) != comp(x) for x in xs[1:]):
+        extras = rng.sample(pool, 2)
+        xs = [x0] + sorted(extras)
+        tx = rng.choice([x for x in pool if x not in extras])
+        dom = rng.choice(T4_DOMAINS)
+        if op(x0) != comp(x0):
             continue
-        demo = "; ".join(f"{x} -> {op(x)}" for x in xs)
-        ans = op(tx)
-        wrong = comp(tx)
-        diverge = next(x for x in xs[1:] if op(x) != comp(x))
-        steps = [
-            (f"Two relations each fit the first pair {xs[0]} -> {op(xs[0])}: the intended one ({label}) and a competitor ({comp_name}). Only one can be the shared relation.", "valid"),
-            (f"Test the competitor against a later pair: {comp_name} predicts {comp(diverge)} for {diverge}, but the pair shows {op(diverge)}. So {comp_name} is not the shared relation.", "valid"),
-            (f"The intended relation ({label}) fits every demonstration: {demo}.", "valid"),
-            (f"Apply the intended relation to {tx}: the answer is {ans}.", "valid"),
-            (f"Check: {wrong} (from the {comp_name} distractor) is rejected because that rule failed an earlier pair; {ans} is the value under the relation that holds throughout.", "valid"),
-        ]
-        prob = (f"Each pair follows one and the same relation, and more than one rule appears to fit at first glance: {demo}. "
-                f"The intended relation is: {label}. Ignore the competing pattern that only fits the first pair. "
-                f"What value completes {tx} -> ?")
-        final = f"{ans}."
-        if prob in seen:
-            continue
-        seen.add(prob)
-        out.append(dict(domain=dom, problem=prob, steps=steps, final=final, difficulty=5,
-                        vm="process_check", split=split,
-                        vd=f"Intended relation verified on all demos; competitor '{comp_name}' fails at {diverge} ({comp(diverge)} vs {op(diverge)}); answer {ans} = op({tx})."))
-    return out
+        return op, label, comp, cname, xs, tx, dom
+    return None
+
+def _mk_t4(spec, split):
+    op, label, comp, cname, xs, tx, dom = spec
+    demo = "; ".join(f"{x} -> {op(x)}" for x in xs)
+    ans = op(tx); wrong = comp(tx)
+    diverge = next(x for x in xs[1:] if op(x) != comp(x))
+    steps = [
+        (f"Two relations each fit the first pair {xs[0]} -> {op(xs[0])}: the intended one ({label}) and a competitor ({cname}). Only one can be the shared relation.", "valid"),
+        (f"Test the competitor against a later pair: {cname} predicts {comp(diverge)} for {diverge}, but the pair shows {op(diverge)}. So {cname} is not the shared relation.", "valid"),
+        (f"The intended relation ({label}) fits every demonstration: {demo}.", "valid"),
+        (f"Apply the intended relation to {tx}: the answer is {ans}.", "valid"),
+        (f"Check: {wrong} (from the {cname} distractor) is rejected because that rule failed an earlier pair; {ans} is the value under the relation that holds throughout.", "valid"),
+    ]
+    prob = (f"Each pair follows one and the same relation, and more than one rule appears to fit at first glance: {demo}. "
+            f"The intended relation is: {label}. Ignore the competing pattern that only fits the first pair. "
+            f"What value completes {tx} -> ?")
+    return dict(domain=dom, problem=prob, steps=steps, final=f"{ans}.", difficulty=5,
+                vm="process_check", split=split,
+                vd=f"Intended relation verified on all demos; competitor '{cname}' fails at {diverge} ({comp(diverge)} vs {op(diverge)}); answer {ans} = op({tx}).")
 
 # ---- CROSS-DOMAIN ISOMORPHISM ENGINE ------------------------------------
 # The core of cross-domain transfer. Each STRUCTURE is one abstract relational
@@ -1078,141 +1123,323 @@ STRUCTURES = [
             ("biology and ecology", "a growing population", "each new cohort", "it matures into breeders so growth accelerates", "a passing predator", True),
             ("science", "an avalanche", "each dislodged mass", "it dislodges still more snow", "a distant peak", True),
          ]),
+    dict(name="a small input controls a much larger output (amplification)",
+         role="is the small control that governs a much larger output",
+         diff=3, insts=[
+            ("engineering and physical systems", "a transistor circuit", "the base current", "a tiny current controls a large one", "the load resistor", False),
+            ("economics and markets", "a leveraged trade", "the margin deposit", "a small stake controls a large position", "the brokerage", False),
+            ("biology and ecology", "an enzyme reaction", "the enzyme", "a trace amount drives a large conversion", "the solvent", False),
+            ("engineering and physical systems", "a lever", "the effort at the long arm", "a small force moves a large load", "the fulcrum block", False),
+            ("social situations", "a rumor's spread", "the first influential sharer", "one well-placed voice moves a large crowd", "the venue", False),
+            ("program behavior", "a feature flag", "the config toggle", "one setting switches behavior for all users", "a log line", True),
+            ("medicine-style diagnosis", "a hormonal signal", "the releasing hormone", "a minute dose triggers a large downstream response", "a blood vessel", True),
+         ]),
+    dict(name="one trigger sets off a self-propagating cascade",
+         role="is the initial trigger that sets off the whole cascade",
+         diff=3, insts=[
+            ("finance and business operations", "a bank run", "the first mass withdrawal", "it spooks others into withdrawing too", "the vault", False),
+            ("biology and ecology", "a trophic collapse", "the loss of the keystone species", "it topples dependent species in turn", "a rock pool", False),
+            ("engineering and physical systems", "a power-grid blackout", "the first overloaded line tripping", "it shifts load and trips the next", "a substation fence", False),
+            ("science", "a chain reaction", "the first fission event", "it releases neutrons that split more nuclei", "the reactor casing", False),
+            ("program behavior", "a cascading outage", "the first overloaded service failing", "its retries overwhelm the next service", "a dashboard", False),
+            ("medicine-style diagnosis", "an allergic cascade", "the first mast-cell release", "it recruits more cells to release in turn", "the skin surface", True),
+            ("social situations", "a stampede", "the first panicked runner", "their motion triggers the crowd to bolt", "the exit sign", True),
+         ]),
+    dict(name="a threshold must be crossed before any effect occurs",
+         role="is the threshold that must be crossed before the effect switches on",
+         diff=3, insts=[
+            ("biology and ecology", "a firing neuron", "the action-potential threshold", "no spike until the voltage crosses it", "the axon sheath", False),
+            ("chemistry", "a reaction needing activation", "the activation energy", "no reaction until the energy barrier is crossed", "the beaker", False),
+            ("economics and markets", "a progressive tax bracket", "the bracket cutoff", "the higher rate applies only past it", "the tax form", False),
+            ("engineering and physical systems", "a static-friction start", "the breakaway force", "the object stays put until force exceeds it", "the floor", False),
+            ("law and regulation", "a legal filing requirement", "the reporting threshold", "no duty to file until the amount exceeds it", "the office", False),
+            ("medicine-style diagnosis", "a drug's effect", "the minimum effective dose", "no clinical effect until the dose crosses it", "the pill bottle", True),
+            ("social situations", "a protest turning into a movement", "the critical mass of participants", "little happens until the count crosses it", "the plaza", True),
+         ]),
+    dict(name="a catalyst speeds a process without being consumed by it",
+         role="is the catalyst that speeds the process without being used up",
+         diff=3, insts=[
+            ("chemistry", "a catalyzed reaction", "the catalyst", "it speeds the reaction and is left unchanged", "a reactant", False),
+            ("economics and markets", "regional commerce", "the shared infrastructure", "it enables far more trade without being traded", "the goods", False),
+            ("biology and ecology", "a metabolic step", "the enzyme", "it accelerates the step and is recovered intact", "the substrate", False),
+            ("social situations", "a productive meeting", "the skilled facilitator", "they speed agreement without being party to it", "the agenda", False),
+            ("program behavior", "a fast build", "the compiler cache", "it speeds rebuilds and is not part of the output", "the source file", False),
+            ("finance and business operations", "a closed deal", "the broker", "they speed the transaction without owning the asset", "the contract", True),
+            ("science", "faster nucleation", "the seed crystal", "it speeds crystallization and stays a tiny fraction", "the solution", True),
+         ]),
 ]
 
-def _iso_items(structures, seen):
-    out = []
-    for st in structures:
-        name, role, diff = st["name"], st["role"], st["diff"]
-        opposing = st.get("opposing", False)
-        train = [i for i in st["insts"] if not i[5]]
-        evalt = [i for i in st["insts"] if i[5]]
-        def role_map_item(target, srcs, split, use_distractor, fmt="rolemap"):
-            (td, tsys, tfill, tctx, tdis, _) = target
-            src_txt = "; ".join(f"in {s[1]}, {s[2]} {role} ({s[3]})" for s in srcs)
-            # leakage guard: the answer must not already appear in the source text
-            ans_head = tfill.split("(")[0].replace("the ", "").strip().lower()
-            if ans_head and ans_head in src_txt.lower():
-                return None
-            if opposing:
-                first_force = tctx  # e.g. "demand from buyers pushes the price up"
-                prob = (f"The same structure -- {name} -- appears in many systems: "
-                        + "; ".join(f"in {s[1]}, {s[3]}, and {s[2]} balances it" for s in srcs)
-                        + f". Now consider {tsys} ({td}): {first_force}. "
-                        f"By the same structure, what opposing influence balances it?")
-                steps = [
-                    (f"Shared structure: {name}. The role to map is the opposing influence that restores balance.", "valid"),
-                    ("; ".join(f"in {s[1]} ({s[0]}) it is {s[2]}" for s in srcs) + " -- different domains, same balancing role.", "valid"),
-                    (f"Map onto {tsys}: given that {first_force}, the influence that balances it is {tfill}.", "valid"),
-                    (f"Check: sources ({', '.join(s[0] for s in srcs)}) and target ({td}) share no vocabulary, so the balancing role -- not surface similarity -- yields {tfill}.", "valid"),
-                ]
-                final = f"{cap(tfill)} -- it is the opposing influence that balances {first_force.split(' pushes')[0].split(' builds')[0]} in {tsys}."
-            elif fmt == "proportional":
-                prob = (f"{cap(srcs[0][2])} is to {srcs[0][1]} as {srcs[1][2]} is to {srcs[1][1]} -- in each, it {role}. "
-                        f"By the same relation, what is to {tsys} ({td})?")
-                if use_distractor and tdis:
-                    prob += f" (Note: {tdis} is present too, but decide by role, not by surface prominence.)"
-                steps = [
-                    (f"Read the relation across the two source pairs: in {srcs[0][1]} it is {srcs[0][2]}, in {srcs[1][1]} it is {srcs[1][2]} -- in each, the element that {role}.", "valid"),
-                    (f"That is one shared structure ({name}) in two unrelated domains ({srcs[0][0]}, {srcs[1][0]}), so it is the relation -- not any surface feature -- that must transfer.", "valid"),
-                    (f"Carry it to {tsys}: the element that {role} there is {tfill}.", "valid"),
-                ]
-                if use_distractor and tdis:
-                    steps.append((f"Reject the surface distractor: {tdis} is present in {tsys} but does not fill this role.", "valid"))
-                steps.append((f"Check: target domain ({td}) differs from both sources and shares no vocabulary with the answer, so only the structural role yields {tfill}.", "valid"))
-                final = f"{cap(tfill)} -- to {tsys} as {srcs[0][2]} is to {srcs[0][1]}."
-            else:
-                prob = (f"The same relational structure -- {name} -- shows up across unrelated systems: {src_txt}. "
-                        f"Now consider {tsys} ({td}). By the same structure, which element {role}?")
-                if use_distractor and tdis:
-                    prob += f" (Note: {tdis} is also present, but decide by role, not by surface prominence.)"
-                steps = [
-                    (f"Shared relational structure: {name}. The role to map across systems is: it {role}.", "valid"),
-                    ("In " + srcs[0][1] + f", that role is filled by {srcs[0][2]}; in {srcs[1][1]}, by {srcs[1][2]} -- different domains, one role.", "valid"),
-                    (f"Map the structure onto {tsys}: the element that {role} there is {tfill}.", "valid"),
-                ]
-                if use_distractor and tdis:
-                    steps.append((f"Reject the surface distractor: {tdis} is present in {tsys} but does not fill this role, so its presence does not make it the answer.", "valid"))
-                steps.append((f"Check: the sources ({srcs[0][0]}, {srcs[1][0]}) and the target ({td}) share no vocabulary, so only the structural role -- not surface similarity -- yields {tfill}.", "valid"))
-                final = f"{cap(tfill)} -- it plays the same role in {tsys} that {srcs[0][2]} plays in {srcs[0][1]}."
-            d = diff + (1 if (use_distractor and tdis) else 0)
-            if prob in seen:
-                return None
-            seen.add(prob)
-            return dict(domain=td, problem=prob, steps=steps, final=final, difficulty=d,
-                        vm="process_check", split=split,
-                        vd=f"Cross-domain role map ({name}): answer fills the target role in a domain ({td}) different from the sources; leakage-guarded so the answer is not present in the source text.")
-        def pick_srcs(target, offset=0):
-            """Two sources from DIFFERENT domains than the target (and from each
-            other where possible), so the cross-domain claim in the trace holds."""
-            td = target[0]
-            cands = [s for s in train if s[0] != td and s is not target]
-            cands = cands[offset:] + cands[:offset]
-            chosen, doms = [], set()
-            for s in cands:
-                if s[0] not in doms:
-                    chosen.append(s); doms.add(s[0])
-                if len(chosen) == 2:
-                    return chosen
-            for s in cands:  # fall back if not enough distinct domains
-                if s not in chosen: chosen.append(s)
-                if len(chosen) == 2: break
+def _iso_srcs(train_insts, target, picks):
+    """Two sources from DIFFERENT domains than the target (and each other)."""
+    td = target[0]
+    cands = [s for s in picks if s[0] != td and s is not target and s in train_insts]
+    chosen, doms = [], set()
+    for s in cands:
+        if s[0] not in doms:
+            chosen.append(s); doms.add(s[0])
+        if len(chosen) == 2:
             return chosen
-        # Per target keep at most TWO items (avoid duplicating the same answer):
-        # one clean and one distractor variant, each with a different source
-        # pairing, and the QUESTION FORMAT rotates across targets for
-        # format-invariance without per-item duplication.
-        for idx, t in enumerate(train):
-            fmt = "proportional" if idx % 2 else "rolemap"
-            variants = [(pick_srcs(t, 0), False), (pick_srcs(t, 2), True)]
-            for srcs, ud in variants:
-                if len(srcs) < 2:
-                    continue
-                it = role_map_item(t, srcs, "train", ud, fmt)
-                if it: out.append(it)
-        # eval: held-out target instances (unseen systems/domains), sources from train
-        for j, t in enumerate(evalt):
-            fmt = "proportional" if j % 2 else "rolemap"
-            variants = [(pick_srcs(t, j), False), (pick_srcs(t, j + 1), True)]
-            for srcs, ud in variants:
-                if len(srcs) < 2:
-                    continue
-                it = role_map_item(t, srcs, "eval", ud, fmt)
-                if it: out.append(it)
+    return None
+
+def _mk_iso(st, target, srcs, split, use_distractor, fmt="rolemap"):
+    name, role, diff = st["name"], st["role"], st["diff"]
+    opposing = st.get("opposing", False)
+    (td, tsys, tfill, tctx, tdis, _) = target
+    src_txt = "; ".join(f"in {s[1]}, {s[2]} {role} ({s[3]})" for s in srcs)
+    ans_head = tfill.split("(")[0].replace("the ", "").strip().lower()
+    if ans_head and ans_head in src_txt.lower():   # leakage guard
+        return None
+    if opposing:
+        first_force = tctx
+        prob = (f"The same structure -- {name} -- appears in many systems: "
+                + "; ".join(f"in {s[1]}, {s[3]}, and {s[2]} balances it" for s in srcs)
+                + f". Now consider {tsys} ({td}): {first_force}. "
+                f"By the same structure, what opposing influence balances it?")
+        steps = [
+            (f"Shared structure: {name}. The role to map is the opposing influence that restores balance.", "valid"),
+            ("; ".join(f"in {s[1]} ({s[0]}) it is {s[2]}" for s in srcs) + " -- different domains, same balancing role.", "valid"),
+            (f"Map onto {tsys}: given that {first_force}, the influence that balances it is {tfill}.", "valid"),
+            (f"Check: sources ({', '.join(s[0] for s in srcs)}) and target ({td}) share no vocabulary, so the balancing role -- not surface similarity -- yields {tfill}.", "valid"),
+        ]
+        final = f"{cap(tfill)} -- it is the opposing influence that balances {first_force.split(' pushes')[0].split(' builds')[0]} in {tsys}."
+    elif fmt == "proportional":
+        prob = (f"{cap(srcs[0][2])} is to {srcs[0][1]} as {srcs[1][2]} is to {srcs[1][1]} -- in each, it {role}. "
+                f"By the same relation, what is to {tsys} ({td})?")
+        if use_distractor and tdis:
+            prob += f" (Note: {tdis} is present too, but decide by role, not by surface prominence.)"
+        steps = [
+            (f"Read the relation across the two source pairs: in {srcs[0][1]} it is {srcs[0][2]}, in {srcs[1][1]} it is {srcs[1][2]} -- in each, the element that {role}.", "valid"),
+            (f"That is one shared structure ({name}) in two unrelated domains ({srcs[0][0]}, {srcs[1][0]}), so it is the relation -- not any surface feature -- that must transfer.", "valid"),
+            (f"Carry it to {tsys}: the element that {role} there is {tfill}.", "valid"),
+        ]
+        if use_distractor and tdis:
+            steps.append((f"Reject the surface distractor: {tdis} is present in {tsys} but does not fill this role.", "valid"))
+        steps.append((f"Check: target domain ({td}) differs from both sources and shares no vocabulary with the answer, so only the structural role yields {tfill}.", "valid"))
+        final = f"{cap(tfill)} -- to {tsys} as {srcs[0][2]} is to {srcs[0][1]}."
+    else:
+        prob = (f"The same relational structure -- {name} -- shows up across unrelated systems: {src_txt}. "
+                f"Now consider {tsys} ({td}). By the same structure, which element {role}?")
+        if use_distractor and tdis:
+            prob += f" (Note: {tdis} is also present, but decide by role, not by surface prominence.)"
+        steps = [
+            (f"Shared relational structure: {name}. The role to map across systems is: it {role}.", "valid"),
+            ("In " + srcs[0][1] + f", that role is filled by {srcs[0][2]}; in {srcs[1][1]}, by {srcs[1][2]} -- different domains, one role.", "valid"),
+            (f"Map the structure onto {tsys}: the element that {role} there is {tfill}.", "valid"),
+        ]
+        if use_distractor and tdis:
+            steps.append((f"Reject the surface distractor: {tdis} is present in {tsys} but does not fill this role, so its presence does not make it the answer.", "valid"))
+        steps.append((f"Check: the sources ({srcs[0][0]}, {srcs[1][0]}) and the target ({td}) share no vocabulary, so only the structural role -- not surface similarity -- yields {tfill}.", "valid"))
+        final = f"{cap(tfill)} -- it plays the same role in {tsys} that {srcs[0][2]} plays in {srcs[0][1]}."
+    d = diff + (1 if (use_distractor and tdis) else 0)
+    return dict(domain=td, problem=prob, steps=steps, final=final, difficulty=d,
+                vm="process_check", split=split,
+                vd=f"Cross-domain role map ({name}): answer fills the target role in a domain ({td}) different from the sources; leakage-guarded so the answer is not present in the source text.")
+
+# --------------------------------------------------------------------------
+# The seed-driven sampling engine.
+#
+# Eval is a STABLE benchmark: a fixed set of held-out items in the plain
+# register, enumerated deterministically, so it is identical every season and
+# saturates (dedup adds nothing on later seasons). Train is sampled from the
+# huge combinatorial space (parametric numeric traps are unbounded; iso has
+# structure x target x source-pair x format; simple has relation x target x
+# phrasing) with a random register per item, so each --seed yields fresh,
+# non-overlapping train items. Volume is set by --per-type (`need`).
+# --------------------------------------------------------------------------
+def _analogical_eval(seen):
+    """Deterministic held-out benchmark (plain register)."""
+    out = []
+    def add(it):
+        if it and it["problem"] not in seen:
+            seen.add(it["problem"]); out.append(it)
+    # simple: eval answer pools (and whole eval-only relations)
+    for rt in ANA_REL:
+        relphrase, left, right, dom, diff, eval_only, pairs = rt
+        _, eval_pairs = _simple_pools(rt)
+        for ti, (t0, ans) in enumerate(eval_pairs):
+            others = [(a, b) for (a, b) in eval_pairs if a != t0][:3]
+            if len(others) < 3:
+                continue
+            add(_mk_simple(relphrase, left, right, dom, diff, t0, ans, others, Q_ANA_EVAL[0], "eval"))
+    # traps: eval skins / a fixed param set
+    for sk in T1_SKINS[6:]:
+        for bi in (0, 1):
+            add(_mk_t1(sk, bi, "eval"))
+    for sk in T2_SKINS[4:]:
+        for nums in [((60, 24, 90), (4, 2, 9)), ((100, 30, 80), (5, 2, 8))]:
+            add(_mk_t2(sk, nums[0], nums[1], "eval"))
+    for sk in T3_SKINS[4:]:
+        add(_mk_t3(sk, "eval"))
+    for spec in [(_sq, "each number maps to its square", _tpl, "tripling", [3, 5, 7], 8, "mathematics"),
+                 (_cube, "each number maps to its cube", (lambda n: 7 * n - 6), "the rule 7n-6", [1, 4, 6], 5, "science")]:
+        add(_mk_t4(spec, "eval"))
+    # iso: held-out target instances, canonical role-map, sources from train insts
+    for st in STRUCTURES:
+        train_insts = [i for i in st["insts"] if not i[5]]
+        evalt = [i for i in st["insts"] if i[5]]
+        for t in evalt:
+            srcs = _iso_srcs(train_insts, t, train_insts)
+            if srcs:
+                add(_mk_iso(st, t, srcs, "eval", False, "rolemap"))
     return out
 
+def _shash(s):
+    """Small stable string hash (Python's hash() is salted per process). Used to
+    pick a phrasing/register DETERMINISTICALLY per answer-identity so a given
+    analogy always renders the same way -> it dedups across seasons and its
+    answer is never re-emitted under a different surface."""
+    h = 2166136261
+    for c in s:
+        h = ((h ^ ord(c)) * 16777619) & 0xFFFFFFFF
+    return h
+
+# clean parametric numeric analogy (no distractor) -- answer-diverse volume at
+# lower difficulty, to balance the difficulty-5 traps.
+_NUM_OPS = [(_sq, "each maps to its square", 2), (_cube, "each maps to its cube", 3),
+            (_dbl, "each maps to double itself", 2), (_tpl, "each maps to triple itself", 2),
+            (_tri, "each maps to the running total 1..n", 3),
+            ((lambda n: n * n + 1), "each maps to (its square + 1)", 3),
+            ((lambda n: n * (n - 1)), "each maps to n*(n-1)", 3)]
+def _mk_num(rng, split):
+    op, label, diff = rng.choice(_NUM_OPS)
+    xs = sorted(rng.sample(range(2, 14), 3)); tx = rng.choice([x for x in range(2, 16) if x not in xs])
+    dom = rng.choice(T4_DOMAINS)
+    demo = "; ".join(f"{x} -> {op(x)}" for x in xs)
+    steps = [
+        (f"Read the relation shared by every pair: {label}. Confirm on the demos: {demo}.", "valid"),
+        (f"The pairs differ in their numbers but share this one relation, so it -- not any single pair -- is what transfers.", "valid"),
+        (f"Apply it to {tx}: the answer is {op(tx)}.", "valid"),
+        (f"Check: {op(tx)} follows the relation that holds across all demonstrations.", "valid"),
+    ]
+    prob = f"Every pair follows one relation ({label}): {demo}. By the same relation, what completes {tx} -> ?"
+    return dict(domain=dom, problem=prob, steps=steps, final=f"{op(tx)}.", difficulty=diff,
+                vm="process_check", split=split,
+                vd=f"Parametric numeric analogy verified: op({tx})={op(tx)} under '{label}'.")
+
+_SCALE_LAWS = [("square", 2, "doubling the input multiplies the output by four"),
+               ("cube", 3, "doubling the input multiplies the output by eight"),
+               ("inverse-square", 2, "halving the distance multiplies the intensity by four")]
+_SCALE_DOMAINS = ["engineering and physical systems", "science", "economics and markets",
+                  "biology and ecology", "chemistry"]
+def _mk_scale(rng, split):
+    """Parametric difficulty-4: transfer a power law across domains; the linear
+    reading is the distractor."""
+    lawname, p, gloss = rng.choice(_SCALE_LAWS)
+    k = rng.randint(2, 6)
+    dom = rng.choice(_SCALE_DOMAINS)
+    ans = k ** p
+    prob = (f"Reference system: the output follows a {lawname} law of the input -- {gloss}, "
+            f"so the output scales with the input raised to the power {p}. "
+            f"An analogous system in {dom} obeys the same {lawname} law; its input is scaled by a factor of {k}. "
+            f"By the same law, the output is scaled by what factor? (A linear reading -- factor {k} -- is the distractor.)")
+    steps = [
+        (f"Relation to transfer: output scales as (input)^{p} (the {lawname} law), not linearly.", "valid"),
+        (f"Reject the surface distractor: a linear reading would give factor {k}, but the law is a power of {p}.", "valid"),
+        (f"Apply the law: the input factor {k} raised to the power {p} is {k}^{p} = {ans}.", "valid"),
+        (f"Check: under a {lawname} law an input factor of {k} yields an output factor of {k}**{p} = {ans}; the linear value {k} is wrong.", "valid"),
+    ]
+    return dict(domain=dom, problem=prob, steps=steps, final=f"A factor of {ans}.", difficulty=4,
+                vm="process_check", split=split,
+                vd=f"Power-law transfer verified: {k}^{p} = {ans}; linear distractor {k} rejected.")
+
 def build_analogical(need, rng, exclude):
-    """Generate the analogical corpus. Items carry an explicit 'split'; the
-    writer partitions by it, so train and eval answer pools stay disjoint.
-    `need` is ignored: the designed set is fixed and fully reproducible."""
-    out, seen = [], set()
-    # --- simple relational-transfer items (difficulty 1-3) ---
-    for rel, left, right, dom, diff, eval_only, pairs in ANA_REL:
-        if eval_only:
-            # whole relation held out for eval: tests transfer to an unseen relation
-            out += _simple_items(rel, left, right, dom, diff, pairs, pairs, Q_ANA_EVAL, "eval", seen)
+    """Two-layer engine.
+
+    Breadth layer (bounded, deterministic): every distinct answer-identity from
+    the banks -- relations, cross-domain structures, trap skins -- rendered ONCE
+    with a phrasing/register fixed by a stable hash of its identity. Stable
+    across seasons, so it dedups and no answer is re-emitted under a new surface.
+
+    Volume layer (unbounded, parametric): numeric analogies, binding-constraint
+    and competing-relation traps with rng-drawn, self-verified numbers -- every
+    item has a genuinely different answer, so volume scales to tens of thousands
+    across seasons without repeating answers. `need` (=--per-type) sets train
+    volume; `rng` (=--seed) drives seasonal freshness; `exclude` dedups vs disk.
+    """
+    out, seen = [], set(exclude)
+    # stable eval benchmark (identical every season; saturates via dedup)
+    for it in _analogical_eval(seen):
+        out.append(it)
+    made = 0
+
+    def emit(it):
+        nonlocal made
+        if it and it["problem"] not in seen:
+            seen.add(it["problem"]); out.append(it); made += 1
+            return True
+        return False
+
+    # ---- breadth layer (deterministic per identity) ----
+    bounded = []
+    for rt in ANA_REL:
+        if rt[5]:
             continue
-        eval_pairs = pairs[-4:]
-        eval_ans = {b for _, b in eval_pairs}
-        # drop any train pair whose ANSWER value also occurs in eval, so eval
-        # answer values are strictly disjoint from train (some relations reuse a
-        # value, e.g. lion->cub and bear->cub).
-        train_pairs = [(a, b) for (a, b) in pairs[:-4] if b not in eval_ans]
-        out += _simple_items(rel, left, right, dom, diff, train_pairs, train_pairs, Q_ANA_TRAIN, "train", seen)
-        out += _simple_items(rel, left, right, dom, diff, eval_pairs, eval_pairs, Q_ANA_EVAL, "eval", seen)
-    # --- difficulty-4/5 trap items, with train/eval skins & params disjoint ---
-    out += _t1_items(T1_SKINS[:6], "train", seen)
-    out += _t1_items(T1_SKINS[6:], "eval", seen)
-    out += _t2_items(T2_SKINS[:4], T2_NUMS, "train", seen)
-    out += _t2_items(T2_SKINS[4:], T2_NUMS, "eval", seen)
-    out += _t3_items(T3_SKINS[:4], "train", seen)
-    out += _t3_items(T3_SKINS[4:], "eval", seen)
-    out += _t4_items(T4_OPS[:4], "train", seen)
-    out += _t4_items(T4_OPS[4:], "eval", seen)
-    # --- cross-domain isomorphism: the core transfer layer ---
-    out += _iso_items(STRUCTURES, seen)
-    # honor dedup against anything already on disk (append-mode safety)
-    out = [it for it in out if it["problem"] not in exclude]
+        relphrase, left, right, dom, diff, _, _ = rt
+        tp = _simple_pools(rt)[0]
+        for t0, ans in tp:
+            others = [(a, b) for (a, b) in tp if a != t0][:3]
+            if len(others) < 3:
+                continue
+            key = "S|" + relphrase + "|" + str(t0)
+            tmpl = Q_ANA_TRAIN[_shash(key) % len(Q_ANA_TRAIN)]
+            it = _mk_simple(relphrase, left, right, dom, diff, t0, ans, others, tmpl, "train")
+            it["problem"] = REGISTERS[_shash("R" + key) % len(REGISTERS)](it["problem"])
+            bounded.append(it)
+    for st in STRUCTURES:
+        ti = [i for i in st["insts"] if not i[5]]
+        if len(ti) < 3:
+            continue
+        for vi, t in enumerate(ti):
+            for variant in (0, 1):     # <=2 framings per (structure,target)
+                order = ti[variant:] + ti[:variant]
+                srcs = _iso_srcs(ti, t, order)
+                if not srcs:
+                    continue
+                fmt = "rolemap" if (st.get("opposing") or variant == 0) else "proportional"
+                ud = bool(t[4]) and variant == 1
+                it = _mk_iso(st, t, srcs, "train", ud, fmt)
+                if not it:
+                    continue
+                key = "I|" + st["name"] + "|" + t[1] + "|" + str(variant)
+                it["problem"] = REGISTERS[_shash(key) % len(REGISTERS)](it["problem"])
+                bounded.append(it)
+    for sk in T1_SKINS[:6]:
+        for bi in (0, 1):
+            it = _mk_t1(sk, bi, "train")
+            it["problem"] = REGISTERS[_shash("T1|" + sk[0] + str(bi)) % len(REGISTERS)](it["problem"])
+            bounded.append(it)
+    for sk in T3_SKINS[:4]:
+        it = _mk_t3(sk, "train")
+        it["problem"] = REGISTERS[_shash("T3|" + sk[1] + sk[3]) % len(REGISTERS)](it["problem"])
+        bounded.append(it)
+    rng.shuffle(bounded)   # order variety only; content is identity-stable
+    for it in bounded:
+        if made >= need:
+            break
+        emit(it)
+
+    # ---- volume layer (parametric, unbounded) ----
+    t2_train = T2_SKINS[:4]
+    # weighted mix spreads difficulty across the volume tail:
+    # num = d2-3, scale = d4, t2/t4 = d5.
+    vol = (["num"] * 4 + ["scale"] * 3 + ["t4"] * 2 + ["t2"] * 2)
+    tries, cap = 0, need * 80 + 5000
+    while made < need and tries < cap:
+        tries += 1
+        pick = rng.choice(vol)
+        if pick == "num":
+            it = _mk_num(rng, "train")
+        elif pick == "scale":
+            it = _mk_scale(rng, "train")
+        elif pick == "t2":
+            nums = _rand_t2_nums(rng)
+            it = _mk_t2(rng.choice(t2_train), nums[0], nums[1], "train") if nums else None
+        else:
+            spec = _rand_t4(rng)
+            it = _mk_t4(spec, "train") if spec else None
+        if it:
+            it["problem"] = _register(rng, it["problem"])
+            emit(it)
     return out
 
 Q_MOR = ["Lay out the strongest case for each side.",

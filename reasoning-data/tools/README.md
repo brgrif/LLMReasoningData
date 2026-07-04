@@ -79,22 +79,31 @@ Difficulty is tagged 1-5 for curriculum ordering.
   from `BANK`-marked lists in `generate.py`. When the report shows one produced
   fewer than requested (`<-- SHORT`), extend the relevant bank; the tool never
   pads a shortfall with duplicates.
-- **Analogical** is procedurally generated in three layers: (1) `STRUCTURES` --
-  the cross-domain isomorphism engine: abstract relational structures each
-  instantiated across many unrelated domains, generating "what plays the same
-  role in system B as X in system A" items where source and target are always
-  different domains (a leakage guard blocks any item whose answer appears in the
-  source text); (2) parametric difficulty-4/5 trap kernels (series blockage,
-  binding constraint by rate, exception-to-exception, competing relations); and
-  (3) `ANA_REL` single-relation completion with explicit role labels. Train and
-  eval draw from disjoint answer pools, and held-out relations / trap-skins /
-  target systems are reserved for eval, so eval tests cross-domain transfer, not
-  recall. Each item carries an explicit `split`. Regenerate cleanly with
-  `python tools/generate.py --only analogical --replace --write` (overwrites the
-  curated files, renumbers ids from 1000); fully reproducible. To scale
-  cross-domain coverage, add structures to `STRUCTURES` or instances (domains) to
-  existing ones -- breadth of structures x domains is what drives transfer, not
-  volume of near-duplicates.
+- **Analogical** is a seed-driven SAMPLING ENGINE (`build_analogical`), not a
+  fixed set. `--per-type` sets train volume; each `--seed` is a fresh season that
+  yields new, non-overlapping items (dedup against everything on disk). Two
+  layers:
+  - *Breadth (bounded, deterministic):* `ANA_REL` (single-relation completion,
+    ~43 relations with role labels) + `STRUCTURES` (the cross-domain isomorphism
+    engine: 12 abstract structures instantiated across ~19 domains, asked as
+    "what plays the same role in system B as X in system A", with a leakage guard
+    blocking any item whose answer appears in the source) + the T1/T3 trap skins.
+    Each answer-identity is emitted once, with phrasing/register fixed by a stable
+    hash of its identity, so it renders identically every season and never
+    reappears under a new surface.
+  - *Volume (unbounded, parametric):* `_mk_num` (clean numeric analogy, d2-3),
+    `_mk_scale` (power-law transfer, d4), `_rand_t2_nums`/`_mk_t2`
+    (binding-constraint, d5), `_rand_t4`/`_mk_t4` (competing relations, d5). Every
+    item draws rng numbers that are recomputed and verified in the trace, so each
+    has a different answer -- this scales to tens of thousands without repeating
+    answers.
+  - Train/eval never overlap: eval is a deterministic, held-out benchmark
+    (`_analogical_eval`) of unseen relations / trap-skins / target systems, in the
+    plain register, so it is identical every season and saturates on append.
+  - Season 1 (fresh eval + train): `--only analogical --replace --per-type N --seed S --write`.
+    Later seasons (append train only): drop `--replace`, change `--seed`.
+    To grow structural/domain BREADTH, extend `ANA_REL`/`STRUCTURES`; the engine
+    fans each addition across domains, formats, and registers automatically.
 - The tool dedups against existing problems and allocates new IDs above the
   global per-type maximum (across `curated/`, `raw/`, and `negatives/`), so
   re-running is safe, additive, and never collides with pre-gate raw candidates.
