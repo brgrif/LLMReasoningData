@@ -75,11 +75,18 @@ Difficulty is tagged 1-5 for curriculum ordering.
 - **New season:** change `--seed`. The verifiable and metacognitive generators
   are randomized/parametric, so a new seed produces genuinely new items with no
   code change.
-- **Bank-limited types:** the authored types (abductive, analogical,
-  moral-ethical) draw from `BANK`-marked lists in `generate.py`. When the report
-  shows one produced fewer than requested (`<-- SHORT`), extend the relevant
-  bank; the tool never pads a shortfall with duplicates. The banks were expanded
-  so a full 500-per-type batch is achievable against the current corpus.
+- **Bank-limited types:** the authored types (abductive, moral-ethical) draw
+  from `BANK`-marked lists in `generate.py`. When the report shows one produced
+  fewer than requested (`<-- SHORT`), extend the relevant bank; the tool never
+  pads a shortfall with duplicates.
+- **Analogical** is procedurally generated from `ANA_REL` (relations with
+  explicit role labels) plus parametric difficulty-4/5 trap kernels (series
+  blockage, binding constraint by rate, exception-to-exception, competing
+  relations). Train and eval draw from disjoint answer pools, and each item
+  carries an explicit `split`, so regeneration is leakage-free by construction.
+  Regenerate the whole type cleanly with
+  `python tools/generate.py --only analogical --replace --write` (overwrites the
+  curated files and renumbers ids from 1000); it is fully reproducible.
 - The tool dedups against existing problems and allocates new IDs above the
   global per-type maximum (across `curated/`, `raw/`, and `negatives/`), so
   re-running is safe, additive, and never collides with pre-gate raw candidates.

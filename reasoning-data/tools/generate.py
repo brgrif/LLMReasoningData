@@ -627,33 +627,378 @@ def build_abductive(need, rng, exclude):
             if len(out) >= need: return out
     return out
 
-Q_ANA = ["{demo}; {t0} : ?  (each pair shares one relation, {R}). Fill the blank.",
-         "Each pair shares the relation '{R}'. Find the term completing the last: {demo}; {t0} -> ?",
-         "In this set the relation is '{R}': {demo}. What completes {t0} : ?",
-         "Same relation in each pair ({R}): {demo}. Complete the last pair: {t0} : ?",
-         "If {demo} follow the relation '{R}', what pairs with {t0}?",
-         "Given the relation '{R}' shown by {demo}, supply the match for {t0}.",
-         "These pairs share the relation '{R}': {demo}. Provide the term for {t0}."]
-def build_analogical(need, rng, exclude):
-    out, seen = [], set()
-    bases = []
-    for rel, dom, diff, items in ANA_BANKS:
-        for i in range(len(items)):
-            target = items[i]; others = [items[j] for j in range(len(items)) if j != i][:3]
-            if len(others) < 3: continue
-            demo = "; ".join(f"{a} : {b}" for a, b in others)
-            steps = [(f"Relation: {rel}.", "valid"), ("Each demonstration instantiates it.", "valid"),
-                     (f"Apply it to {target[0]}.", "valid"), (f"The matching item is {target[1]}.", "valid"),
-                     ("Check: the relation holds; surface content differs.", "valid")]
-            bases.append((rel, dom, diff, target, demo, steps))
-    for stem in Q_ANA:
-        for rel, dom, diff, target, demo, steps in bases:
-            prob = stem.format(R=rel, demo=demo, t0=target[0])
-            if prob in exclude or prob in seen: continue
+# --------------------------------------------------------------------------
+# ANALOGICAL
+#
+# Design (see reasoning-types/analogical.md):
+#   * Analogical reasoning transfers a RELATIONAL STRUCTURE from source to
+#     target, mapping roles rather than surface features. So every trace names
+#     the roles and performs the mapping; there is no boilerplate "instantiates
+#     it" filler step.
+#   * Surface content is varied while structure is held fixed, so only the
+#     relation - not vocabulary co-occurrence - solves the item.
+#   * The difficulty-4/5 items carry a real surface DISTRACTOR (or a competing
+#     relation) that the trace must reject BY ROLE. These are the items that
+#     force structural mapping; the earlier corpus lacked them entirely.
+#
+# Anti-leakage: train and eval draw from DISJOINT answer pools. For each
+# relation the answer pairs are partitioned so an eval target answer never
+# appears (as demo or answer) in any train item; several whole relations and
+# whole trap-skins are held out for eval to test transfer to unseen relations
+# too. Each instance carries an explicit "split" the writer honors, so the
+# split is structural, not a blind slice of one ordered list.
+# --------------------------------------------------------------------------
+def _art(w):
+    """Correct indefinite article for a word (handles unit/use/hour-style cases)."""
+    wl = w.lower()
+    if wl[:3] in ("uni", "use", "uti", "ubi", "eur") or wl.startswith("one"):
+        return "a " + w
+    if wl[:1] == "h" and wl[:5] in ("hour", "honor", "hones"):
+        return "an " + w
+    return ("an " if wl[:1] in "aeiou" else "a ") + w
+
+# (relation phrase, left role, right role, domain, difficulty, eval_only, pairs)
+ANA_REL = [
+    ("animal to the sound it makes", "animal", "sound", "biology and ecology", 1, False,
+     [("dog","bark"),("cat","meow"),("cow","moo"),("duck","quack"),("lion","roar"),("horse","neigh"),("sheep","bleat"),("frog","croak"),("bee","buzz"),("snake","hiss"),("owl","hoot"),("wolf","howl"),("pig","oink"),("crow","caw"),("hen","cluck")]),
+    ("animal to its young", "animal", "young", "biology and ecology", 1, False,
+     [("dog","puppy"),("cat","kitten"),("cow","calf"),("horse","foal"),("sheep","lamb"),("lion","cub"),("frog","tadpole"),("hen","chick"),("kangaroo","joey"),("bear","cub"),("deer","fawn"),("goat","kid"),("duck","duckling"),("fox","kit"),("eagle","eaglet")]),
+    ("profession to its tool", "profession", "tool", "engineering and physical systems", 2, False,
+     [("chef","knife"),("painter","brush"),("carpenter","hammer"),("writer","pen"),("surgeon","scalpel"),("photographer","camera"),("farmer","plow"),("tailor","needle"),("gardener","spade"),("blacksmith","anvil"),("dentist","drill"),("barber","scissors"),("mechanic","wrench"),("sculptor","chisel"),("cartographer","compass")]),
+    ("object to its material", "object", "material", "engineering and physical systems", 2, False,
+     [("book","paper"),("window","glass"),("tire","rubber"),("wire","copper"),("ring","gold"),("bottle","plastic"),("table","wood"),("blade","steel"),("sweater","wool"),("brick","clay"),("candle","wax"),("rope","fiber"),("balloon","latex"),("crayon","wax"),("mug","ceramic")]),
+    ("member to its category", "member", "category", "biology and ecology", 2, False,
+     [("apple","fruit"),("car","vehicle"),("violin","instrument"),("salmon","fish"),("oak","tree"),("sparrow","bird"),("iron","metal"),("rose","flower"),("whale","mammal"),("triangle","shape"),("tennis","sport"),("oxygen","gas"),("ruby","gemstone"),("maple","tree"),("trumpet","instrument")]),
+    ("word to a stronger-degree version", "word", "stronger form", "formal grammars and symbol systems", 2, False,
+     [("warm","hot"),("big","huge"),("cool","cold"),("good","great"),("tired","exhausted"),("small","tiny"),("happy","ecstatic"),("bad","terrible"),("wet","soaked"),("hungry","starving"),("angry","furious"),("quiet","silent"),("pretty","gorgeous"),("funny","hilarious"),("sad","devastated")]),
+    ("cause to its typical effect", "cause", "typical effect", "science", 2, False,
+     [("spark","fire"),("virus","illness"),("rain","flood"),("study","knowledge"),("exercise","fitness"),("drought","famine"),("friction","heat"),("practice","skill"),("investment","growth"),("pollution","smog"),("training","endurance"),("sunlight","photosynthesis")]),
+    ("active driver to the medium it moves", "driver", "medium moved", "engineering and physical systems", 2, False,
+     [("heart","blood"),("pump","water"),("battery","charge"),("fan","air"),("turbine","steam"),("plunger","fluid"),("escalator","people"),("conveyor","packages"),("speaker","sound"),("windmill","grain")]),
+    ("tool to its function", "tool", "function", "engineering and physical systems", 2, False,
+     [("knife","cutting"),("pen","writing"),("key","unlocking"),("broom","sweeping"),("thermometer","measuring temperature"),("compass","finding direction"),("ruler","measuring length"),("clock","telling time"),("filter","removing impurities"),("brake","stopping"),("magnet","attracting iron"),("shovel","digging")]),
+    ("country to its capital", "country", "capital", "science", 2, False,
+     [("France","Paris"),("Japan","Tokyo"),("Egypt","Cairo"),("Peru","Lima"),("Kenya","Nairobi"),("Norway","Oslo"),("Cuba","Havana"),("Nepal","Kathmandu"),("Ghana","Accra"),("Chile","Santiago"),("Iraq","Baghdad"),("Greece","Athens")]),
+    ("unit to what it measures", "unit", "measured quantity", "science", 2, False,
+     [("meter","length"),("gram","mass"),("second","time"),("ampere","current"),("volt","voltage"),("watt","power"),("liter","volume"),("kelvin","temperature"),("pascal","pressure"),("hertz","frequency"),("joule","energy"),("mole","amount")]),
+    ("element to its chemical symbol", "element", "chemical symbol", "chemistry", 2, False,
+     [("hydrogen","H"),("oxygen","O"),("carbon","C"),("sodium","Na"),("iron","Fe"),("gold","Au"),("helium","He"),("nitrogen","N"),("chlorine","Cl"),("potassium","K"),("calcium","Ca"),("silver","Ag"),("copper","Cu"),("lead","Pb")]),
+    ("instrument to its family", "instrument", "family", "engineering and physical systems", 2, False,
+     [("violin","strings"),("trumpet","brass"),("flute","woodwind"),("drum","percussion"),("cello","strings"),("clarinet","woodwind"),("trombone","brass"),("timpani","percussion"),("harp","strings"),("oboe","woodwind"),("tuba","brass"),("cymbal","percussion")]),
+    ("profession to its workplace", "profession", "workplace", "economics and markets", 2, False,
+     [("chef","kitchen"),("judge","courtroom"),("teacher","classroom"),("pilot","cockpit"),("surgeon","operating room"),("farmer","field"),("actor","stage"),("banker","bank"),("librarian","library"),("chemist","laboratory"),("barista","cafe"),("miner","mine")]),
+    ("word to its opposite", "word", "opposite", "formal grammars and symbol systems", 1, False,
+     [("hot","cold"),("up","down"),("fast","slow"),("open","closed"),("day","night"),("win","lose"),("push","pull"),("rise","fall"),("wet","dry"),("near","far"),("full","empty"),("begin","end"),("light","dark"),("buy","sell")]),
+    ("animal to its habitat", "animal", "habitat", "biology and ecology", 2, False,
+     [("fish","water"),("camel","desert"),("polar bear","the arctic"),("monkey","jungle"),("mole","underground"),("frog","pond"),("lion","savanna"),("penguin","antarctica"),("bat","cave"),("whale","ocean"),("owl","forest"),("crab","shore")]),
+    ("whole to one of its parts", "whole", "part", "engineering and physical systems", 2, False,
+     [("car","wheel"),("tree","branch"),("book","page"),("house","room"),("body","limb"),("computer","keyboard"),("bicycle","pedal"),("clock","hand"),("guitar","string"),("flower","petal"),("ship","deck"),("phone","screen")]),
+    ("process to its product", "process", "product", "science", 2, False,
+     [("photosynthesis","glucose"),("combustion","heat"),("digestion","nutrients"),("evaporation","vapor"),("fermentation","alcohol"),("erosion","sediment"),("condensation","water"),("respiration","energy"),("baking","bread"),("smelting","metal"),("distillation","spirit"),("weathering","soil")]),
+    ("number to its square", "number", "square", "mathematics", 1, False,
+     [("2","4"),("3","9"),("4","16"),("5","25"),("6","36"),("7","49"),("8","64"),("9","81"),("10","100"),("11","121"),("12","144"),("13","169")]),
+    ("shape to its number of sides", "shape", "number of sides", "mathematics", 1, False,
+     [("triangle","3"),("square","4"),("pentagon","5"),("hexagon","6"),("heptagon","7"),("octagon","8"),("nonagon","9"),("decagon","10"),("quadrilateral","4"),("dodecagon","12")]),
+    ("programming construct to its purpose", "construct", "purpose", "program behavior", 2, False,
+     [("loop","repetition"),("function","reuse"),("variable","storage"),("conditional","branching"),("array","indexed collection"),("pointer","indirection"),("exception","error handling"),("comment","documentation"),("constant","fixed value"),("recursion","self-reference")]),
+    ("legal area to what it governs", "legal area", "subject governed", "law and regulation", 3, False,
+     [("tort law","civil injuries"),("contract law","agreements"),("criminal law","offenses"),("property law","ownership"),("family law","domestic relations"),("tax law","levies"),("labor law","employment"),("maritime law","shipping"),("patent law","inventions"),("constitutional law","state powers")]),
+    ("chemical formula to its common name", "formula", "common name", "chemistry", 2, False,
+     [("NaCl","salt"),("H2O","water"),("CO2","carbon dioxide"),("CH4","methane"),("NH3","ammonia"),("O2","oxygen"),("C6H12O6","glucose"),("NaHCO3","baking soda"),("H2O2","hydrogen peroxide"),("CaCO3","limestone")]),
+    ("planet to its order from the sun", "planet", "order from the sun", "science", 2, False,
+     [("Mercury","first"),("Venus","second"),("Earth","third"),("Mars","fourth"),("Jupiter","fifth"),("Saturn","sixth"),("Uranus","seventh"),("Neptune","eighth")]),
+    ("currency to its country", "currency", "country", "economics and markets", 2, False,
+     [("yen","Japan"),("pound","Britain"),("rupee","India"),("peso","Mexico"),("won","South Korea"),("real","Brazil"),("rand","South Africa"),("lira","Turkey"),("baht","Thailand"),("zloty","Poland")]),
+    ("metric prefix to its factor", "prefix", "factor", "science", 2, False,
+     [("kilo","thousand"),("mega","million"),("giga","billion"),("milli","thousandth"),("micro","millionth"),("nano","billionth"),("centi","hundredth"),("deci","tenth"),("tera","trillion"),("hecto","hundred")]),
+    ("verb to its past tense", "verb", "past tense", "formal grammars and symbol systems", 2, False,
+     [("go","went"),("run","ran"),("eat","ate"),("see","saw"),("take","took"),("buy","bought"),("bring","brought"),("teach","taught"),("think","thought"),("catch","caught"),("build","built"),("sing","sang")]),
+    ("sport to its playing surface", "sport", "playing surface", "social situations", 2, False,
+     [("soccer","pitch"),("tennis","court"),("ice hockey","rink"),("golf","course"),("baseball","diamond"),("bowling","lane"),("swimming","pool"),("boxing","ring"),("cricket","pitch"),("track","oval")]),
+    ("data structure to its access pattern", "data structure", "access pattern", "algorithms and program analysis", 3, False,
+     [("stack","last-in first-out"),("queue","first-in first-out"),("array","random access"),("linked list","sequential access"),("hash map","key lookup"),("heap","priority order"),("binary search tree","sorted traversal"),("graph","adjacency")]),
+    # --- relations reserved ENTIRELY for eval: test transfer to unseen relations ---
+    ("worker to what they produce", "worker", "product", "economics and markets", 2, True,
+     [("baker","bread"),("author","book"),("brewer","beer"),("mason","wall"),("weaver","cloth"),("potter","pottery"),("cobbler","shoes"),("vintner","wine"),("smith","tools"),("jeweler","jewelry")]),
+    ("gas to a hazard it poses", "substance", "hazard", "chemistry", 3, True,
+     [("methane","explosion"),("carbon monoxide","asphyxiation"),("chlorine","corrosion"),("radon","radiation"),("ammonia","burns"),("hydrogen","fire"),("ozone","lung irritation"),("sulfur dioxide","acid rain")]),
+    ("polygon to its interior angle sum", "polygon", "interior angle sum", "mathematics", 3, True,
+     [("triangle","180"),("quadrilateral","360"),("pentagon","540"),("hexagon","720"),("heptagon","900"),("octagon","1080"),("nonagon","1260"),("decagon","1440")]),
+    ("device to the energy conversion it performs", "device", "energy conversion", "engineering and physical systems", 3, True,
+     [("motor","electrical to mechanical"),("generator","mechanical to electrical"),("battery","chemical to electrical"),("solar cell","light to electrical"),("microphone","sound to electrical"),("speaker","electrical to sound"),("heater","electrical to thermal"),("turbine","kinetic to mechanical")]),
+]
+
+Q_ANA_TRAIN = [
+    "{demo}. Each pair shares one relation: {rel}. By the same relation, complete: {t0} : ?",
+    "Relation held constant ({rel}): {demo}. What completes the pair {t0} : ?",
+    "In every pair {aleft} maps to its {right} ({demo}). Give the {right} for {t0}.",
+]
+Q_ANA_EVAL = [
+    "These pairs share exactly one relation ({rel}): {demo}. Supply the term for {t0}.",
+    "Given the relation {rel} shown by {demo}, what pairs with {t0}?",
+]
+
+def _simple_items(rel, left, right, dom, diff, targets, pool, phrasings, split, seen):
+    """One item per target, demos drawn from `pool` (excluding the target)."""
+    out = []
+    for t0, ans in targets:
+        others = [(a, b) for (a, b) in pool if a != t0][:3]
+        if len(others) < 3:
+            continue
+        demo = "; ".join(f"{a} -> {b}" for a, b in others)
+        d1, d2, d3 = others
+        steps = [
+            (f"Relation being transferred: {_art(left)} maps to its {right}. Demonstrated by {d1[0]} -> {d1[1]}, {d2[0]} -> {d2[1]}, {d3[0]} -> {d3[1]}.", "valid"),
+            (f"Hold that relation fixed and change only the {left}: apply it to '{t0}'.", "valid"),
+            (f"The {right} of {t0} is {ans}.", "valid"),
+            (f"Check: the demonstrations and '{t0}' share the relation but differ in surface content, so the structure -- not word overlap -- fixes the answer as {ans}.", "valid"),
+        ]
+        for tmpl in phrasings:
+            prob = tmpl.format(demo=demo, rel=rel, t0=t0, left=left, right=right, aleft=_art(left))
+            if prob in seen:
+                continue
             seen.add(prob)
-            out.append(dict(domain=dom, problem=prob, steps=steps, final=cap(str(target[1]))+".",
-                            difficulty=diff, vm="process_check", vd=f"Completes the '{rel}' relation; mapping stated."))
-            if len(out) >= need: return out
+            out.append(dict(domain=dom, problem=prob, steps=steps, final=cap(str(ans)) + ".",
+                            difficulty=diff, vm="process_check", split=split,
+                            vd=f"Answer fills the '{right}' role of the '{rel}' relation for '{t0}'; mapping shown across the demonstrations, surface content varied."))
+    return out
+
+# ---- difficulty-4/5 trap kernels ----------------------------------------
+# T1: series flow blockage with a local-damage surface distractor.
+# (target system, medium, stage-noun, [n1,n2,n3], connector, failure verb,
+#  distractor clause, distractor short label, domain)
+T1_SKINS = [
+    ("a building's climate duct", "conditioned air", "gallery", ["Aldermoor","Brightwell","Corvane"], "damper", "jammed shut",
+     "a painting in the first gallery has visibly faded", "faded painting", "engineering and physical systems"),
+    ("a series lighting string", "current", "fixture", ["Ash","Birch","Cedar"], "connector", "corroded open",
+     "the first fixture's shade is cracked", "cracked shade", "engineering and physical systems"),
+    ("a garden irrigation line", "water", "bed", ["North bed","Mid bed","South bed"], "valve", "seized closed",
+     "a plant in the first bed has yellow leaves", "yellow leaves", "biology and ecology"),
+    ("a factory conveyor feed", "parts", "station", ["Cutting","Welding","Painting"], "gate", "locked shut",
+     "the first station's guard rail is scratched", "scratched rail", "engineering and physical systems"),
+    ("a municipal water main", "supply", "district", ["Harbor","Midtown","Ridge"], "shutoff", "failed closed",
+     "a hydrant in the first district is repainted", "repainted hydrant", "engineering and physical systems"),
+    ("a data pipeline", "records", "stage", ["Ingest","Transform","Load"], "gate", "blocking",
+     "the ingest dashboard has a cosmetic label typo", "label typo", "program behavior"),
+    ("a district heating loop", "hot water", "block", ["Elm","Fir","Grove"], "isolation valve", "stuck shut",
+     "a radiator in the first block is dented", "dented radiator", "engineering and physical systems"),
+    ("a supply chain leg", "goods", "hub", ["Port","Depot","Store"], "checkpoint", "closed",
+     "the port's signage is outdated", "outdated signage", "finance and business operations"),
+]
+def _t1_items(skins, split, seen):
+    out = []
+    for sys_, medium, stage, nodes, conn, fail, distr, distr_lbl, dom in skins:
+        n1, n2, n3 = nodes
+        for bi in (0, 1):  # blockage after node bi; stages after it lose supply
+            blocked = nodes[bi]
+            downstream = nodes[bi + 1:]
+            upstream = nodes[:bi + 1]
+            ds = ", ".join(downstream)
+            us = ", ".join(upstream)
+            # subject-verb agreement: singular when the list names one stage
+            us_sit, us_keep, us_stay = ("sits", "keeps", "stays") if len(upstream) == 1 else ("sit", "keep", "stay")
+            ds_lie, ds_lose = ("lies", "loses") if len(downstream) == 1 else ("lie", "lose")
+            prob = (f"Reference relation: in a chain where {medium} flows in series, "
+                    f"if one link is blocked, everything downstream of the block loses supply while everything upstream keeps it. "
+                    f"Present case: {sys_} carries {medium} in series through {n1}, then {n2}, then {n3}; "
+                    f"the {conn} at {blocked} has {fail}. Note also that {distr}. "
+                    f"By the same relation, which element plays the blocked-link role, and which {_plural(stage)} lose {medium}? "
+                    f"(One observation is a surface look-alike; decide by role, not appearance.)")
+            steps = [
+                (f"Relational template: {medium} flows in series through a chain; a single point-block cuts off everything downstream of it while upstream stages are unaffected.", "valid"),
+                (f"Map roles: the series chain -> {n1}, then {n2}, then {n3}; the blocked link (the thing that stops onward flow) -> {_art(conn)} that has failed.", "valid"),
+                (f"Locate the block in the target: the {conn} at {blocked} has {fail}, so it fills the blocked-link role.", "valid"),
+                (f"Propagate along the structure: {us} {us_sit} at or before the block and {us_keep} {medium}; {ds} {ds_lie} downstream of it and {ds_lose} {medium}.", "valid"),
+                (f"Reject the surface distractor: '{distr}' resembles damage, but the template concerns flow blockage, not local cosmetic harm, so it does not fill the blocked-link role.", "valid"),
+                (f"Check: the mapping preserves the relation (a point-block cuts downstream flow); the answer follows from the series structure, not from surface resemblance.", "valid"),
+            ]
+            final = (f"The {conn} at {blocked} plays the blocked-link role; {ds} {ds_lose} {medium} while {us} {us_stay} supplied. "
+                     f"The {distr_lbl} is a surface look-alike, not the blockage.")
+            prob_key = prob
+            if prob_key in seen:
+                continue
+            seen.add(prob_key)
+            out.append(dict(domain=dom, problem=prob, steps=steps, final=final, difficulty=4,
+                            vm="process_check", split=split,
+                            vd="Answer fills the blocked-link role by the series-flow structure; the cosmetic observation is rejected as a surface look-alike."))
+    return out
+
+# T2: binding constraint = min(stock / per-unit need), NOT min(stock).
+# (domain, register, item-noun, [r1,r2,r3], unit)
+T2_SKINS = [
+    ("chemistry", "a perfume bench", "bottle", ["essence X", "essence Y", "essence Z"], "drops"),
+    ("biology and ecology", "a plant-breeding program", "cross", ["line L-1", "line L-2", "line L-3"], "pollen units"),
+    ("finance and business operations", "a workshop", "gift box", ["ribbon", "cards", "beads"], "units"),
+    ("engineering and physical systems", "an assembly cell", "kit", ["bolts", "brackets", "gaskets"], "pieces"),
+    ("economics and markets", "a bakery", "cake", ["flour", "eggs", "sugar"], "grams"),
+    ("chemistry", "a lab prep", "batch", ["reagent A", "reagent B", "reagent C"], "mL"),
+]
+# (stocks, rates) chosen so argmin(stock/rate) != argmin(stock); verified below.
+T2_NUMS = [
+    ((60, 24, 90), (4, 2, 9)),
+    ((100, 30, 80), (5, 2, 8)),
+    ((120, 40, 75), (6, 3, 15)),
+    ((48, 20, 66), (4, 2, 11)),
+    ((90, 36, 84), (5, 3, 14)),
+    ((72, 28, 96), (4, 2, 12)),
+]
+def _plural(noun):
+    """English plural for the simple item nouns used here."""
+    if noun.endswith(("s", "x", "ch", "sh")):
+        return noun + "es"
+    if noun.endswith("y") and noun[-2:-1] not in "aeiou":
+        return noun[:-1] + "ies"
+    return noun + "s"
+
+def _t2_items(skins, nums, split, seen):
+    out = []
+    for dom, reg, item, res, unit in skins:
+        items = _plural(item)
+        for stocks, rates in nums:
+            caps = [s // r for s, r in zip(stocks, rates)]
+            binding = min(range(3), key=lambda i: stocks[i] / rates[i])
+            raw_min = min(range(3), key=lambda i: stocks[i])
+            if binding == raw_min:
+                continue  # the trap requires the two readings to disagree
+            mincount = caps[binding]
+            r1, r2, r3 = res
+            s1, s2, s3 = stocks
+            q1, q2, q3 = rates
+            prob = (f"Rule for {reg}: the number of {items} you can complete is set by the resource with the smallest "
+                    f"stock-divided-by-per-{item} need -- which is frequently NOT the one you have least of overall. "
+                    f"Apply that same relation here. Each {item} needs {q1} {unit} of {r1}, {q2} of {r2}, and {q3} of {r3}; "
+                    f"in stock you have {s1} {unit} of {r1}, {s2} of {r2}, and {s3} of {r3}. "
+                    f"Which resource runs out first (caps the count), and how many {items} do you get? "
+                    f"(The resource you have least of by raw amount is a distractor.)")
+            steps = [
+                (f"Relation to transfer: the binding resource minimizes stock / per-{item} need, not raw stock.", "valid"),
+                (f"Compute the supported count for each: {r1} = {s1}/{q1} = {caps[0]}; {r2} = {s2}/{q2} = {caps[1]}; {r3} = {s3}/{q3} = {caps[2]} {items}.", "valid"),
+                (f"Name the distractor: by raw amount the scarcest is {res[raw_min]} ({stocks[raw_min]} {unit}), which the surface reading would wrongly pick.", "valid"),
+                (f"By the intended relation the minimum supported count is {mincount}, at {res[binding]}, even though its raw stock ({stocks[binding]}) is not the smallest.", "valid"),
+                (f"Check: {mincount} {items} consume {mincount*q1} of {r1} (<= {s1}), {mincount*q2} of {r2} (<= {s2}), {mincount*q3} of {r3} (<= {s3}); one more would need {(mincount+1)*rates[binding]} of {res[binding]}, exceeding {stocks[binding]}. Mapping confirmed.", "valid"),
+            ]
+            final = f"{cap(res[binding])} runs out first; you can complete {mincount} {items}."
+            if prob in seen:
+                continue
+            seen.add(prob)
+            out.append(dict(domain=dom, problem=prob, steps=steps, final=final, difficulty=5,
+                            vm="process_check", split=split,
+                            vd=f"Binding constraint recomputed: min(stock/need) = {mincount} at {res[binding]}; the raw-scarcest resource {res[raw_min]} is correctly rejected as a distractor."))
+    return out
+
+# T3: exception-to-the-exception reinstates the base rule; a relabeled item is
+# a surface distractor that stays in the plain-exception role.
+# (domain, all-noun, base outcome verb-phrase, exempt subclass, reinstating
+#  condition, distractor condition)
+T3_SKINS = [
+    ("program behavior", "event", "journaled", "keep-alive event", "tagged 'reconcile'", "rerouted to a neighbouring node"),
+    ("law and regulation", "shipment", "taxed at the border", "in-transit shipment", "unpacked for local sale", "relabeled with a new tracking code"),
+    ("finance and business operations", "account", "charged a monthly fee", "student account", "overdrawn past the limit", "renamed after a profile update"),
+    ("program behavior", "request", "logged", "health-check request", "carrying an error flag", "redirected to a mirror endpoint"),
+    ("law and regulation", "building", "subject to the noise ordinance", "place of worship", "hosting a ticketed concert", "repainted a different colour"),
+    ("biology and ecology", "cell", "flagged for apoptosis", "stem cell", "showing DNA damage", "relocated to another tissue"),
+]
+def _t3_items(skins, split, seen):
+    out = []
+    for dom, alln, base, exempt, reinstate, distr in skins:
+        prob = (f"Structural rule (three levels): every {alln} is {base}; {_art(exempt)} is an exception and is NOT {base}; "
+                f"but {_art(exempt)} that is {reinstate} is {base} again -- the base outcome is reinstated at the third level. "
+                f"Careful: some {exempt}s are merely {distr}, which superficially looks like the reinstated case but is not. "
+                f"By the same three-level relation, which class of {alln} has the base outcome ({base}) reinstated?")
+        steps = [
+            (f"Relational template: a base rule R applies to all items; an exception E suspends R for a subclass; an exception-to-E reinstates R for a sub-subclass.", "valid"),
+            (f"Map the levels: R = '{base}' (all {alln}s); E = {exempt}s (R suspended); the role to fill is the sub-subclass where R returns.", "valid"),
+            (f"The sub-subclass whose base outcome returns is {exempt}s that are {reinstate}: they are {base} again.", "valid"),
+            (f"Reject the distractor: {exempt}s that are merely {distr} still are NOT {base}; being relabeled or moved does not reinstate R, so they occupy role E, not the exception-to-E role.", "valid"),
+            (f"Check: the answer fills the exact third-level role (base outcome reinstated); the relation matches even though the vocabulary differs from the source.", "valid"),
+        ]
+        final = f"The {exempt}s that are {reinstate} -- they have the base outcome ({base}) reinstated."
+        if prob in seen:
+            continue
+        seen.add(prob)
+        out.append(dict(domain=dom, problem=prob, steps=steps, final=final, difficulty=4,
+                        vm="process_check", split=split,
+                        vd="Answer fills the exception-to-exception role; the merely-relabeled subclass is rejected as a surface distractor that remains in role E."))
+    return out
+
+# T4: competing relations -- two rules each fit the first pair, only one fits
+# ALL pairs; transfer the consistent one. Numerically verified.
+# (label, true op, competitor op, competitor-name)
+def _sq(n): return n * n
+def _cube(n): return n * n * n
+def _dbl(n): return 2 * n
+def _tpl(n): return 3 * n
+def _tri(n): return n * (n + 1) // 2  # triangular number
+T4_OPS = [
+    ("each number maps to its square", _sq, "tripling", _tpl, [3, 4, 5, 6], 7, "mathematics"),
+    ("each number maps to its square", _sq, "doubling", _dbl, [2, 3, 4, 5], 6, "mathematics"),
+    ("each number maps to its cube", _cube, "squaring", _sq, [2, 3, 4], 5, "mathematics"),
+    ("each number maps to the sum 1..n", _tri, "doubling", _dbl, [2, 3, 4, 5], 6, "mathematics"),
+    ("each input maps to its square (units produced)", _sq, "tripling", _tpl, [4, 5, 6], 8, "economics and markets"),
+    ("each reading maps to its cube", _cube, "doubling", _dbl, [2, 3, 4], 6, "science"),
+]
+def _t4_items(ops, split, seen):
+    out = []
+    for label, op, comp_name, comp, xs, tx, dom in ops:
+        # keep only demos where the true op is single-valued and the competitor
+        # agrees on the FIRST demo but diverges on a later one (a real competitor)
+        if op(xs[0]) != comp(xs[0]):
+            continue
+        if not any(op(x) != comp(x) for x in xs[1:]):
+            continue
+        demo = "; ".join(f"{x} -> {op(x)}" for x in xs)
+        ans = op(tx)
+        wrong = comp(tx)
+        diverge = next(x for x in xs[1:] if op(x) != comp(x))
+        steps = [
+            (f"Two relations each fit the first pair {xs[0]} -> {op(xs[0])}: the intended one ({label}) and a competitor ({comp_name}). Only one can be the shared relation.", "valid"),
+            (f"Test the competitor against a later pair: {comp_name} predicts {comp(diverge)} for {diverge}, but the pair shows {op(diverge)}. So {comp_name} is not the shared relation.", "valid"),
+            (f"The intended relation ({label}) fits every demonstration: {demo}.", "valid"),
+            (f"Apply the intended relation to {tx}: the answer is {ans}.", "valid"),
+            (f"Check: {wrong} (from the {comp_name} distractor) is rejected because that rule failed an earlier pair; {ans} is the value under the relation that holds throughout.", "valid"),
+        ]
+        prob = (f"Each pair follows one and the same relation, and more than one rule appears to fit at first glance: {demo}. "
+                f"The intended relation is: {label}. Ignore the competing pattern that only fits the first pair. "
+                f"What value completes {tx} -> ?")
+        final = f"{ans}."
+        if prob in seen:
+            continue
+        seen.add(prob)
+        out.append(dict(domain=dom, problem=prob, steps=steps, final=final, difficulty=5,
+                        vm="process_check", split=split,
+                        vd=f"Intended relation verified on all demos; competitor '{comp_name}' fails at {diverge} ({comp(diverge)} vs {op(diverge)}); answer {ans} = op({tx})."))
+    return out
+
+def build_analogical(need, rng, exclude):
+    """Generate the analogical corpus. Items carry an explicit 'split'; the
+    writer partitions by it, so train and eval answer pools stay disjoint.
+    `need` is ignored: the designed set is fixed and fully reproducible."""
+    out, seen = [], set()
+    # --- simple relational-transfer items (difficulty 1-3) ---
+    for rel, left, right, dom, diff, eval_only, pairs in ANA_REL:
+        if eval_only:
+            # whole relation held out for eval: tests transfer to an unseen relation
+            out += _simple_items(rel, left, right, dom, diff, pairs, pairs, Q_ANA_EVAL, "eval", seen)
+            continue
+        eval_pairs = pairs[-4:]
+        eval_ans = {b for _, b in eval_pairs}
+        # drop any train pair whose ANSWER value also occurs in eval, so eval
+        # answer values are strictly disjoint from train (some relations reuse a
+        # value, e.g. lion->cub and bear->cub).
+        train_pairs = [(a, b) for (a, b) in pairs[:-4] if b not in eval_ans]
+        out += _simple_items(rel, left, right, dom, diff, train_pairs, train_pairs, Q_ANA_TRAIN, "train", seen)
+        out += _simple_items(rel, left, right, dom, diff, eval_pairs, eval_pairs, Q_ANA_EVAL, "eval", seen)
+    # --- difficulty-4/5 trap items, with train/eval skins & params disjoint ---
+    out += _t1_items(T1_SKINS[:6], "train", seen)
+    out += _t1_items(T1_SKINS[6:], "eval", seen)
+    out += _t2_items(T2_SKINS[:4], T2_NUMS, "train", seen)
+    out += _t2_items(T2_SKINS[4:], T2_NUMS, "eval", seen)
+    out += _t3_items(T3_SKINS[:4], "train", seen)
+    out += _t3_items(T3_SKINS[4:], "eval", seen)
+    out += _t4_items(T4_OPS[:4], "train", seen)
+    out += _t4_items(T4_OPS[4:], "eval", seen)
+    # honor dedup against anything already on disk (append-mode safety)
+    out = [it for it in out if it["problem"] not in exclude]
     return out
 
 Q_MOR = ["Lay out the strongest case for each side.",
@@ -688,9 +1033,14 @@ BUILDERS = {"deductive": build_deductive, "inductive": build_inductive, "probabi
             "abductive": build_abductive, "analogical": build_analogical, "moral-ethical": build_moral}
 NEG_BUILDERS = {"deductive": neg_deductive, "inductive": neg_inductive, "probabilistic": neg_probabilistic,
                 "counterfactual": neg_counterfactual, "causal": neg_causal}
+# analogical is procedurally generated from ANA_REL + parametric trap kernels
+# (the trap arithmetic is recomputed here), so it is labeled procedural -- not
+# human_expert/hand-authored, which would misrepresent how it was produced.
 GEN_METHOD = {t: ("multi_agent" if t == "metacognitive" else
-                  "human_expert" if t in {"abductive","analogical","moral-ethical"} else "procedural") for t in RT}
-SOURCE = {t: ("hand-authored" if t in {"abductive","analogical","moral-ethical"} else "procedural-gen, verified") for t in RT}
+                  "human_expert" if t in {"abductive","moral-ethical"} else "procedural") for t in RT}
+SOURCE = {t: ("hand-authored" if t in {"abductive","moral-ethical"}
+              else "procedural-gen" if t == "analogical"      # by-construction + computed checks, awaits Solver pass
+              else "procedural-gen, verified") for t in RT}
 
 # --------------------------------------------------------------------------
 # Word / relation / scenario BANKS  (# BANK: extend to scale a type)
@@ -747,37 +1097,6 @@ CAUSAL_DIRECT = [
     ("tightening the bolt","less vibration","mechanical / systems troubleshooting"),("increasing the voltage","a brighter bulb","engineering and physical systems"),
     ("adding cache","faster responses","program behavior"),("raising the tariff","fewer imports","economics and markets"),
     ("heating the gas","higher pressure","chemistry"),("pruning the branch","denser regrowth","biology and ecology"),
-]
-ANA_BANKS = [  # BANK: extend to scale analogical (each item is one leave-one-out target x formats)
-    ("animal to the sound it makes","biology and ecology",1,[("dog","bark"),("cat","meow"),("cow","moo"),("duck","quack"),("lion","roar"),("horse","neigh"),("sheep","bleat"),("frog","croak"),("bee","buzz"),("snake","hiss"),("owl","hoot"),("wolf","howl"),("pig","oink"),("crow","caw"),("hen","cluck")]),
-    ("animal to its young","biology and ecology",1,[("dog","puppy"),("cat","kitten"),("cow","calf"),("horse","foal"),("sheep","lamb"),("lion","cub"),("frog","tadpole"),("hen","chick"),("kangaroo","joey"),("bear","cub"),("deer","fawn"),("goat","kid"),("duck","duckling"),("fox","kit"),("eagle","eaglet")]),
-    ("profession to its tool","engineering and physical systems",2,[("chef","knife"),("painter","brush"),("carpenter","hammer"),("writer","pen"),("surgeon","scalpel"),("photographer","camera"),("farmer","plow"),("tailor","needle"),("gardener","spade"),("blacksmith","anvil"),("dentist","drill"),("barber","scissors"),("mechanic","wrench"),("sculptor","chisel"),("cartographer","compass")]),
-    ("object to its material","engineering and physical systems",2,[("book","paper"),("window","glass"),("tire","rubber"),("wire","copper"),("ring","gold"),("bottle","plastic"),("table","wood"),("blade","steel"),("sweater","wool"),("brick","clay"),("candle","wax"),("rope","fiber"),("balloon","latex"),("coin","metal"),("jar","glass")]),
-    ("member to its category","biology and ecology",2,[("apple","fruit"),("car","vehicle"),("violin","instrument"),("salmon","fish"),("oak","tree"),("sparrow","bird"),("iron","metal"),("rose","flower"),("whale","mammal"),("triangle","shape"),("tennis","sport"),("oxygen","gas"),("ruby","gemstone"),("maple","tree"),("trumpet","instrument")]),
-    ("word to a stronger-degree version","formal grammars and symbol systems",2,[("warm","hot"),("big","huge"),("cool","cold"),("good","great"),("tired","exhausted"),("small","tiny"),("happy","ecstatic"),("bad","terrible"),("wet","soaked"),("hungry","starving"),("angry","furious"),("quiet","silent"),("pretty","gorgeous"),("funny","hilarious"),("sad","devastated")]),
-    ("cause to its typical effect","science",2,[("spark","fire"),("virus","illness"),("rain","flood"),("study","knowledge"),("exercise","fitness"),("drought","famine"),("friction","heat"),("practice","skill"),("investment","growth"),("pollution","smog"),("training","endurance"),("sunlight","photosynthesis")]),
-    ("driver to the medium it moves","engineering and physical systems",2,[("heart","blood"),("pump","water"),("battery","charge"),("fan","air"),("turbine","steam"),("sump pump","water"),("escalator","people"),("conveyor","packages"),("speaker","sound"),("windmill","grain")]),
-    ("tool to its function","engineering and physical systems",2,[("knife","cutting"),("pen","writing"),("key","unlocking"),("broom","sweeping"),("thermometer","measuring temperature"),("compass","finding direction"),("ruler","measuring length"),("clock","telling time"),("filter","removing impurities"),("brake","stopping"),("magnet","attracting iron"),("shovel","digging")]),
-    ("country to its capital","science",2,[("France","Paris"),("Japan","Tokyo"),("Egypt","Cairo"),("Peru","Lima"),("Kenya","Nairobi"),("Norway","Oslo"),("Cuba","Havana"),("Nepal","Kathmandu"),("Ghana","Accra"),("Chile","Santiago"),("Iraq","Baghdad"),("Greece","Athens")]),
-    ("unit to what it measures","science",2,[("meter","length"),("gram","mass"),("second","time"),("ampere","current"),("volt","voltage"),("watt","power"),("liter","volume"),("kelvin","temperature"),("pascal","pressure"),("hertz","frequency"),("joule","energy"),("mole","amount")]),
-    ("element to its chemical symbol","chemistry",2,[("hydrogen","H"),("oxygen","O"),("carbon","C"),("sodium","Na"),("iron","Fe"),("gold","Au"),("helium","He"),("nitrogen","N"),("chlorine","Cl"),("potassium","K"),("calcium","Ca"),("silver","Ag"),("copper","Cu"),("lead","Pb")]),
-    ("instrument to its family","engineering and physical systems",2,[("violin","strings"),("trumpet","brass"),("flute","woodwind"),("drum","percussion"),("cello","strings"),("clarinet","woodwind"),("trombone","brass"),("timpani","percussion"),("harp","strings"),("oboe","woodwind"),("tuba","brass"),("cymbal","percussion")]),
-    ("profession to its workplace","economics and markets",2,[("chef","kitchen"),("judge","courtroom"),("teacher","classroom"),("pilot","cockpit"),("surgeon","operating room"),("farmer","field"),("actor","stage"),("banker","bank"),("librarian","library"),("chemist","laboratory"),("barista","cafe"),("miner","mine")]),
-    ("word to its opposite","formal grammars and symbol systems",1,[("hot","cold"),("up","down"),("fast","slow"),("open","closed"),("day","night"),("win","lose"),("push","pull"),("rise","fall"),("wet","dry"),("near","far"),("full","empty"),("begin","end"),("light","dark"),("buy","sell")]),
-    ("animal to its habitat","biology and ecology",2,[("fish","water"),("camel","desert"),("polar bear","the arctic"),("monkey","jungle"),("mole","underground"),("frog","pond"),("lion","savanna"),("penguin","antarctica"),("bat","cave"),("whale","ocean"),("owl","forest"),("crab","shore")]),
-    ("whole to one of its parts","engineering and physical systems",2,[("car","wheel"),("tree","branch"),("book","page"),("house","room"),("body","limb"),("computer","keyboard"),("bicycle","pedal"),("clock","hand"),("guitar","string"),("flower","petal"),("ship","deck"),("phone","screen")]),
-    ("process to its product","science",2,[("photosynthesis","glucose"),("combustion","heat"),("digestion","nutrients"),("evaporation","vapor"),("fermentation","alcohol"),("erosion","sediment"),("condensation","water"),("respiration","energy"),("baking","bread"),("smelting","metal"),("distillation","spirit"),("weathering","soil")]),
-    ("number to its square","mathematics",1,[("2","4"),("3","9"),("4","16"),("5","25"),("6","36"),("7","49"),("8","64"),("9","81"),("10","100"),("11","121"),("12","144"),("13","169")]),
-    ("shape to its number of sides","mathematics",1,[("triangle","3"),("square","4"),("pentagon","5"),("hexagon","6"),("heptagon","7"),("octagon","8"),("nonagon","9"),("decagon","10"),("quadrilateral","4"),("dodecagon","12")]),
-    ("programming construct to its purpose","program behavior",2,[("loop","repetition"),("function","reuse"),("variable","storage"),("conditional","branching"),("array","indexed collection"),("pointer","indirection"),("exception","error handling"),("comment","documentation"),("constant","fixed value"),("recursion","self-reference")]),
-    ("legal area to what it governs","law and regulation",3,[("tort law","civil injuries"),("contract law","agreements"),("criminal law","offenses"),("property law","ownership"),("family law","domestic relations"),("tax law","levies"),("labor law","employment"),("maritime law","shipping"),("patent law","inventions"),("constitutional law","state powers")]),
-    ("chemical formula to its common name","chemistry",2,[("NaCl","salt"),("H2O","water"),("CO2","carbon dioxide"),("CH4","methane"),("NH3","ammonia"),("O2","oxygen"),("C6H12O6","glucose"),("NaHCO3","baking soda"),("H2O2","hydrogen peroxide"),("CaCO3","limestone")]),
-    ("planet to its order from the sun","science",2,[("Mercury","first"),("Venus","second"),("Earth","third"),("Mars","fourth"),("Jupiter","fifth"),("Saturn","sixth"),("Uranus","seventh"),("Neptune","eighth")]),
-    ("currency to its country","economics and markets",2,[("yen","Japan"),("pound","Britain"),("rupee","India"),("peso","Mexico"),("won","South Korea"),("real","Brazil"),("rand","South Africa"),("lira","Turkey"),("baht","Thailand"),("zloty","Poland")]),
-    ("metric prefix to its factor","science",2,[("kilo","thousand"),("mega","million"),("giga","billion"),("milli","thousandth"),("micro","millionth"),("nano","billionth"),("centi","hundredth"),("deci","tenth"),("tera","trillion"),("hecto","hundred")]),
-    ("verb to its past tense","formal grammars and symbol systems",2,[("go","went"),("run","ran"),("eat","ate"),("see","saw"),("take","took"),("buy","bought"),("bring","brought"),("teach","taught"),("think","thought"),("catch","caught"),("build","built"),("sing","sang")]),
-    ("sport to its playing surface","social situations",2,[("soccer","pitch"),("tennis","court"),("ice hockey","rink"),("golf","course"),("baseball","diamond"),("bowling","lane"),("swimming","pool"),("boxing","ring"),("cricket","pitch"),("track","oval")]),
-    ("data structure to its access pattern","algorithms and program analysis",3,[("stack","last-in first-out"),("queue","first-in first-out"),("array","random access"),("linked list","sequential access"),("hash map","key lookup"),("heap","priority order"),("binary search tree","sorted traversal"),("graph","adjacency")]),
 ]
 # ABD_BANK: (domain, subject, [ (distinguishing-signature, planted-cause, [(alt, why-ruled-out), ...]) ])
 # BANK: extend to scale abductive.
@@ -1069,6 +1388,10 @@ def main():
     ap.add_argument("--created", default=datetime.date.today().isoformat(), help="ISO date stamped on provenance.created")
     ap.add_argument("--write", action="store_true", help="actually append to data/ (default: dry run)")
     ap.add_argument("--report-only", action="store_true", help="print current corpus stats and exit")
+    ap.add_argument("--only", default="", help="comma-separated reasoning types to (re)generate; default all")
+    ap.add_argument("--replace", action="store_true",
+                    help="overwrite the affected types' curated files and renumber ids from 1000, "
+                         "instead of appending. Use with --only for a clean regeneration of one type.")
     args = ap.parse_args()
 
     data_dir = os.path.join(args.root, "data")
@@ -1081,28 +1404,45 @@ def main():
             c = counts[t]; print(f"  {t:15s} train={c['train']:4d} eval={c['eval']:4d} neg={c['neg']:4d}")
         return
 
+    only = [t.strip() for t in args.only.split(",") if t.strip()] or list(RT)
+    bad = [t for t in only if t not in RT]
+    if bad: raise SystemExit(f"--only has unknown types: {bad}")
+
     rng = random.Random(args.seed)
     new_files = {}          # rel path -> list of records
+    replace_files = set()   # rel paths to overwrite rather than append
     report = []
-    for t in RT:
-        pool = BUILDERS[t](args.per_type, rng, existing[t])
-        produced = min(len(pool), args.per_type)
-        chosen = pool[:produced]
-        n_eval = int(round(produced * (1 - args.train_frac)))
-        n_train = produced - n_eval
-        gid = max_id[t] + 1          # single rising counter, above every existing id
+    for t in only:
+        # In replace mode regenerate the whole type: don't dedup against the
+        # copy already on disk (we are overwriting it) and renumber from 1000.
+        excl = set() if args.replace else existing[t]
+        pool = BUILDERS[t](args.per_type, rng, excl)
+        # Items may carry an explicit structural 'split' (analogical does, to keep
+        # train/eval answer pools disjoint). Otherwise fall back to a fraction slice.
+        tagged = any("split" in it for it in pool)
+        produced = len(pool) if tagged else min(len(pool), args.per_type)
+        chosen = pool if tagged else pool[:produced]
+        if tagged:
+            n_train = sum(1 for it in chosen if it.get("split") == "train")
+            n_eval = len(chosen) - n_train
+        else:
+            n_eval = int(round(produced * (1 - args.train_frac)))
+            n_train = produced - n_eval
+        gid = 1000 if args.replace else max_id[t] + 1  # rising counter above existing ids
         pre = PREFIX[t]; new_train = []
         doms = set()
         for i, it in enumerate(chosen):
             it["_created"] = args.created
-            split = "train" if i < n_train else "eval"
+            split = it.get("split") or ("train" if i < n_train else "eval")
             num = gid + i
             rid = f"{pre}-{num:06d}"
             rec = make(rid, t, it["domain"], it["problem"], it["steps"], it["final"], True, it["difficulty"],
                        GEN_METHOD[t], it["vm"], True, it["vd"], SOURCE[t], None, args.created, confidence=it.get("confidence"))
             errs = validate(rec, "curated", canon)
             if errs: raise SystemExit(f"VALIDATION FAIL {rid}: {errs}")
-            new_files.setdefault(f"curated/{t}.{split}.jsonl", []).append(rec)
+            relpath = f"curated/{t}.{split}.jsonl"
+            new_files.setdefault(relpath, []).append(rec)
+            if args.replace: replace_files.add(relpath)
             doms.add(it["domain"])
             if split == "train": new_train.append((rid, it))
         made_neg = 0
@@ -1144,9 +1484,12 @@ def main():
     for rel, recs in sorted(new_files.items()):
         path = os.path.join(data_dir, rel)
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "a") as fh:
+        mode = "w" if rel in replace_files else "a"
+        with open(path, mode) as fh:
             for r in recs:
                 fh.write(json.dumps(r, ensure_ascii=False) + "\n")
+    if replace_files:
+        print("REPLACED (overwritten):", ", ".join(sorted(replace_files)))
     print(f"\nWROTE {total} records to {data_dir}")
 
 if __name__ == "__main__":
