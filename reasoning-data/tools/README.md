@@ -77,15 +77,38 @@ The generator is organized around four levers:
 
 Difficulty is tagged 1-5 for curriculum ordering.
 
+### Held-out eval for every type
+
+Every `build_<type>` now follows the analogical pattern: it emits a
+**deterministic held-out eval** from a *reserved* region -- reserved predicate
+vocabulary (deductive, metacognitive `_met_affirm`), reserved coefficient/query
+ranges (inductive, probabilistic, counterfactual), reserved driver/entity banks
+(causal, abductive, moral-ethical) -- plus an eval-only question stem where the
+answer is otherwise a bare value. Train draws only from the *complementary*
+region. Consequences, enforced by `tools/audit_reasoning_types.py`:
+
+- train and eval never share a problem, and the (structural-signature,
+  final_answer) leakage between them is 0 (analogical: 1-2, coincidence);
+- the eval is identical every season, so it **saturates** (adds nothing) on
+  append while train grows -- a stable benchmark across seasons;
+- difficulty spans 1-5 for every type (moral-ethical 2-5).
+
 ### Reuse across seasons
 
-- **New season:** change `--seed`. The verifiable and metacognitive generators
-  are randomized/parametric, so a new seed produces genuinely new items with no
-  code change.
-- **Bank-limited types:** the authored types (abductive, moral-ethical) draw
-  from `BANK`-marked lists in `generate.py`. When the report shows one produced
-  fewer than requested (`<-- SHORT`), extend the relevant bank; the tool never
-  pads a shortfall with duplicates.
+- **New season:** change `--seed`. All parametric generators (the five
+  verifiable types, metacognitive, abductive's fault-localization layer, and
+  analogical) produce genuinely new train items on a new seed -- confirmed by
+  the seed-varying gate (two seeds, second adds mostly-new train). `causal` was
+  converted from a fixed bank enumeration to parametric families (numeric
+  confounder with a partial-correlation branch, mediation decomposition, RCT,
+  collider bias, Simpson's paradox), so it now scales freely.
+- **Bank-bound type:** `moral-ethical` is a pure bank (`MORAL_BANK` x 8 analysis
+  MODES); its ceiling is `len(bank) x modes`. A new seed adds ~0 -- extend
+  `MORAL_BANK` to scale. Each mode produces a genuinely different analysis (not
+  one trace re-skinned across stems), so every (scenario, mode) is a distinct
+  reasoning task. `abductive` mixes a capped bank layer (each `ABD_BANK` base
+  emitted once, stem fixed by a stable hash) with a parametric fault-localization
+  layer that carries the volume.
 - **Analogical** is a seed-driven SAMPLING ENGINE (`build_analogical`), not a
   fixed set. `--per-type` sets train volume; each `--seed` is a fresh season that
   yields new, non-overlapping items (dedup against everything on disk). Two
@@ -120,9 +143,14 @@ Difficulty is tagged 1-5 for curriculum ordering.
 
 ### Honesty
 
-Verifiable types are genuinely checked. The rubric/ranking types
-(abductive = `answer_match` by ranking, analogical = `process_check`,
-moral-ethical = `rubric_judge`) are authored so the planted ground truth matches
-by construction; they carry their verification method but await an independent
-Solver/judge pass (PIPELINE.md). The report marks any type whose achievable
-count fell short, so coverage is never overstated.
+Every record is `generation_method: procedural` -- the whole corpus is produced
+by this script, so nothing is labeled `human_expert`/`multi_agent`/`hand-authored`
+(which would misrepresent it). `provenance.source` is honest: `procedural-gen,
+verified` for the five verifiable types (their verifier is actually run and only
+passing items are emitted), `procedural-gen from authored banks` for abductive
+and moral-ethical, `procedural-gen` otherwise. The rubric/ranking types
+(abductive = `answer_match`, analogical/metacognitive = `process_check`,
+moral-ethical = `rubric_judge`) match their planted ground truth by construction
+and await an independent Solver/judge pass (PIPELINE.md). The report marks any
+type whose achievable count fell short (`<-- SHORT`), so coverage is never
+overstated, and the tool never pads a shortfall with near-duplicate answers.

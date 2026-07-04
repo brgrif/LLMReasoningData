@@ -2,7 +2,31 @@
 
 Items that passed every gate. Positives only: `is_correct` true and `verification.passed` true. Split into `{type}.train.jsonl` and `{type}.eval.jsonl`; eval problems are never used as generation seeds and never appear in a train file. This is the only set eligible for SFT positive targets and RLVR. See DATA.md and TRAINING.md.
 
-Current contents: most reasoning types hold 1,300 examples (1,040 train / 260 eval); analogical holds 6,226 (6,000 train / 226 eval) in this season and is designed to scale much further across seasons (see below), spanning many domains and several distinct question formats per type. The verifiable types (deductive, inductive, probabilistic, counterfactual, causal) were checked by executing their verifier; abductive and moral-ethical are template-authored with their verification method recorded, awaiting an independent Solver/judge pass.
+Current contents (train / eval / paired negatives):
+
+| type | train | eval | negatives |
+| --- | --- | --- | --- |
+| deductive | 6,000 | 120 | 1,500 |
+| inductive | 5,000 | 86 | 1,250 |
+| probabilistic | 5,000 | 110 | 1,250 |
+| counterfactual | 5,000 | 92 | 1,250 |
+| causal | 5,000 | 102 | 1,249 |
+| analogical | 6,000 | 548 | -- |
+| metacognitive | 3,000 | 82 | -- |
+| abductive | 2,500 | 68 | -- |
+| moral-ethical | 2,000 | 128 | -- |
+
+**All nine types are now seed-driven with a deterministic, held-out eval** (not just analogical). Each `build_<type>` emits a fixed benchmark drawn from a *reserved* parameter/entity region (disjoint from train) plus a parametric/bank train layer, so: train and eval never share a problem; the (structural-signature, final_answer) leakage between them is zero (analogical: 1-2, coincidence); and the eval is identical every season (it saturates on append while train grows). Difficulty spans 1-5 for every type (moral-ethical spans 2-5: it has no trivial dilemmas). Every record is `generation_method: procedural` with an honest `provenance.source` -- nothing is labeled `human_expert`/`hand-authored`, because the whole corpus is produced by `tools/generate.py`. The verifiable types (deductive, inductive, probabilistic, counterfactual, causal) are checked by executing their verifier in Python and only passing items are emitted; analogical/abductive/metacognitive/moral-ethical carry their verification method (process_check / answer_match / rubric_judge) by construction and await an independent Solver/judge pass.
+
+Reproduce the corpus (deterministic, per the exact commands in the season log below):
+
+```
+# season 1 (fresh eval + train); season 2 appends new train, eval saturates
+python tools/generate.py --only deductive     --replace --per-type 3000 --seed 100 --write
+python tools/generate.py --only deductive               --per-type 3000 --seed 101 --write
+# ... analogical/inductive/probabilistic/counterfactual/causal/abductive/metacognitive similarly;
+# moral-ethical is bank-bound: one --replace season at --per-type 2000 reaches its ceiling.
+```
 
 Analogical is a **seed-driven sampling engine**, not a fixed set. `--per-type` sets train volume and each `--seed` is a fresh "season" that yields new, non-overlapping items (dedup is enforced against everything already on disk), so the corpus grows to tens of thousands by appending seasons:
 
