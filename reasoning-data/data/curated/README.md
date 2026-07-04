@@ -6,21 +6,35 @@ Current contents (train / eval / paired negatives):
 
 | type | train | eval | negatives |
 | --- | --- | --- | --- |
-| deductive | 10,000 | 120 | 2,500 |
-| inductive | 10,000 | 86 | 2,500 |
-| probabilistic | 10,000 | 110 | 2,500 |
-| counterfactual | 10,000 | 92 | 2,500 |
-| causal | 10,000 | 102 | 2,499 |
-| analogical | 10,000 | 548 | -- |
-| metacognitive | 10,000 | 82 | -- |
-| abductive | 10,000 | 84 | -- |
-| moral-ethical | 5,500 | 240 | -- |
+| deductive | 100,000 | 120 | 25,000 |
+| inductive | 100,000 | 86 | 25,000 |
+| counterfactual | 100,000 | 92 | 25,000 |
+| metacognitive | 100,000 | 82 | -- |
+| analogical | 100,000 | 548 | -- |
+| abductive | 100,000 | 156 | -- |
+| probabilistic | 80,000 | 110 | 20,000 |
+| causal | 45,000 | 102 | 11,249 |
+| moral-ethical | 6,000 | 240 | -- |
 
-Eight types scale to 10,000 train by appending seasons (parametric volume);
-**moral-ethical is bank-bound** (its ceiling is dilemmas x analysis modes) and
-holds 5,500 -- extended honestly with 15 genuine analysis lenses over ~400
-dilemmas rather than padded to 10,000 with near-duplicate answers (RULES.md
-forbids padding). Every moral train item has a distinct trace and final.
+Each type is scaled to **the top of its honest limit** (measured, not padded):
+
+- **100,000** for the six types whose parametric/compound problem space is
+  effectively unbounded (deductive ~10^12 chains, inductive/counterfactual/
+  metacognitive/analogical parametric, abductive over adjective x noun components).
+- **80,000 / 45,000** for probabilistic and causal, which have *fixed*
+  combinatorial grids (measured ceilings ~97,920 and ~55,000); held just under
+  the ceiling so the season never has to enumerate the whole space.
+- **6,000** for moral-ethical, which is bank-bound (dilemmas x 15 analysis
+  modes, ceiling ~6,030) -- extended honestly rather than padded to a round
+  number, since RULES.md forbids padding with near-duplicate answers.
+
+Every split is leakage-free (0 train/eval overlap; 0 structural-signature +
+answer leakage, analogical 2 by coincidence) and spans difficulty 1-5
+(moral-ethical 2-5). Total corpus: ~838k records.
+
+Splits larger than ~95 MiB are sharded (`{type}.train.jsonl` +
+`{type}.train.NNN.jsonl`) so no file exceeds the 100 MiB host limit; the shards
+are logically one split (see SCHEMA.md). The tooling reads them transparently.
 
 **All nine types are now seed-driven with a deterministic, held-out eval** (not just analogical). Each `build_<type>` emits a fixed benchmark drawn from a *reserved* parameter/entity region (disjoint from train) plus a parametric/bank train layer, so: train and eval never share a problem; the (structural-signature, final_answer) leakage between them is zero (analogical: 1-2, coincidence); and the eval is identical every season (it saturates on append while train grows). Difficulty spans 1-5 for every type (moral-ethical spans 2-5: it has no trivial dilemmas). Every record is `generation_method: procedural` with an honest `provenance.source` -- nothing is labeled `human_expert`/`hand-authored`, because the whole corpus is produced by `tools/generate.py`. The verifiable types (deductive, inductive, probabilistic, counterfactual, causal) are checked by executing their verifier in Python and only passing items are emitted; analogical/abductive/metacognitive/moral-ethical carry their verification method (process_check / answer_match / rubric_judge) by construction and await an independent Solver/judge pass.
 

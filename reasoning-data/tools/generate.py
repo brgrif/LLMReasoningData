@@ -84,6 +84,47 @@ ID_RE = re.compile(r'^(ded|ind|abd|ana|cau|cfa|prb|met|mor)-\d{6}(-neg)?$')
 REQ = ["id","reasoning_type","domain","problem","reasoning_trace","final_answer",
        "is_correct","difficulty","generation_method","verification","provenance"]
 
+# A single JSONL file is capped below GitHub's 100 MiB hard limit; larger splits
+# roll over into numbered shards ({type}.{split}.001.jsonl, .002.jsonl, ...).
+# Shard names still contain ".train."/".eval.", so load_corpus (which globs
+# **/*.jsonl) and the audit tool read them transparently.
+MAX_SHARD_BYTES = 95 * 1024 * 1024
+
+def _shard_files(data_dir, rel):
+    """Existing shard paths for a relpath base, in order (base first)."""
+    base = os.path.join(data_dir, rel)
+    stem = base[:-6]  # drop ".jsonl"
+    out = [base] if os.path.exists(base) else []
+    i = 1
+    while os.path.exists(f"{stem}.{i:03d}.jsonl"):
+        out.append(f"{stem}.{i:03d}.jsonl"); i += 1
+    return base, stem, out
+
+def write_sharded(data_dir, rel, recs, replace):
+    """Append recs to rel, rolling over to a new shard once a file would exceed
+    MAX_SHARD_BYTES. In replace mode, existing shards are removed first."""
+    base, stem, existing = _shard_files(data_dir, rel)
+    os.makedirs(os.path.dirname(base), exist_ok=True)
+    if replace:
+        for p in existing:
+            os.remove(p)
+        existing = []
+    if not existing:
+        cur, idx, curbytes = base, 0, 0
+    else:
+        cur, idx, curbytes = existing[-1], len(existing) - 1, os.path.getsize(existing[-1])
+    fh = open(cur, "a")
+    try:
+        for r in recs:
+            line = json.dumps(r, ensure_ascii=False) + "\n"
+            nb = len(line.encode("utf-8"))
+            if curbytes and curbytes + nb > MAX_SHARD_BYTES:
+                fh.close(); idx += 1
+                cur = f"{stem}.{idx:03d}.jsonl"; fh = open(cur, "w"); curbytes = 0
+            fh.write(line); curbytes += nb
+    finally:
+        fh.close()
+
 def load_canonical_domains(root):
     txt = open(os.path.join(root, "DOMAINS.md")).read()
     return set(re.findall(r'^- \*\*(.+?)\.\*\*', txt, re.M))
@@ -1176,10 +1217,19 @@ def _mk_abd_localize(dom, stages, jfail, distract, split):
 # Component names for fault-localization: adjective x noun -> realistic, distinct
 # stage names. Eval reserves the last 3 adjectives, so every eval component name
 # (hence every eval fault-answer) is disjoint from train.
+# Adjective x noun compound component names. The LAST 3 adjectives are reserved
+# for eval, so every eval fault-answer is disjoint from train. Pools are sized so
+# distinct answers (train_adj x noun + bank) stay well above ~1000, keeping
+# answer-reuse reasonable even at 100k train.
 ABD_ADJ = ["intake", "primary", "secondary", "upstream", "relief", "bypass", "main", "auxiliary",
-           "inlet", "outlet", "control", "feed", "return", "pilot", "booster", "trim", "isolation", "purge"]
+           "inlet", "outlet", "control", "feed", "return", "pilot", "booster",
+           "supply", "drain", "vent", "charge", "discharge", "suction", "delivery", "transfer",
+           "recirculation", "makeup", "standby", "emergency", "backup", "lead", "lag",
+           "trim", "isolation", "purge"]
 ABD_NOUN = ["valve", "pump", "filter", "sensor", "regulator", "manifold", "coupling", "relay",
-            "gate", "module", "junction", "buffer", "compressor", "exchanger", "actuator", "condenser"]
+            "gate", "module", "junction", "buffer", "compressor", "exchanger", "actuator", "condenser",
+            "turbine", "blower", "strainer", "damper", "injector", "nozzle", "seal", "bearing",
+            "gearbox", "heater", "cooler", "tank", "reservoir", "controller", "transducer", "impeller"]
 ABD_LOC_DOMS = ["engineering and physical systems", "mechanical / systems troubleshooting",
                 "program behavior", "incident and root-cause analysis", "chemistry",
                 "biology and ecology", "science", "finance and business operations",
@@ -3536,15 +3586,10 @@ def main():
         print("\nDRY RUN - nothing written. Re-run with --write to append.")
         return
     for rel, recs in sorted(new_files.items()):
-        path = os.path.join(data_dir, rel)
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        mode = "w" if rel in replace_files else "a"
-        with open(path, mode) as fh:
-            for r in recs:
-                fh.write(json.dumps(r, ensure_ascii=False) + "\n")
+        write_sharded(data_dir, rel, recs, replace=rel in replace_files)
     if replace_files:
         print("REPLACED (overwritten):", ", ".join(sorted(replace_files)))
-    print(f"\nWROTE {total} records to {data_dir}")
+    print(f"\nWROTE {total} records to {data_dir} (files sharded at {MAX_SHARD_BYTES // (1024*1024)} MiB)")
 
 if __name__ == "__main__":
     main()
