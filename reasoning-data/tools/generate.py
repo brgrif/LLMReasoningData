@@ -233,17 +233,21 @@ def build_deductive(need, rng, exclude):
     return out
 
 def neg_deductive(tid, it):
+    # A proper negative COMMITS the fallacy and reaches the WRONG answer (SCHEMA.md):
+    # given the chain first -> ... -> last, it observes `last` and wrongly concludes
+    # `first` (affirming the consequent), answering "Yes" when the truth is "No".
     subj, preds, hops = it["subj"], it["preds"], it["hops"]
     first, last = preds[0], preds[-1]
     prob = ("Rules: " + " ".join(f"If the {subj} is {preds[i]}, then it is {preds[i+1]}." for i in range(hops))
-            + f" Observed: the {subj} is {last}. Someone concludes it must be {first}. Is that valid?")
+            + f" Observed: the {subj} is {last}. Someone concludes the {subj} must therefore be {first}. Is that inference valid?")
     return make(tid+"-neg", "deductive", it["domain"], prob,
-        [("The premises are as given.", "valid"),
-         (f"They infer '{first}' from '{last}', reversing the implications.", "invalid"),
-         ("This affirms the consequent, an invalid inference.", "invalid")],
-        f"No; concluding '{first}' affirms the consequent.", False, it["difficulty"], "procedural",
+        [(f"Observed: the {subj} is {last}.", "valid"),
+         (f"Read the final rule backward: since '{preds[hops-1]} -> {last}', treat {last} as giving back '{preds[hops-1]}'.", "invalid"),
+         (f"Chain that backward reading to the start and land on '{first}'.", "invalid"),
+         (f"Conclude the {subj} must be {first}.", "invalid")],
+        f"Yes, the {subj} must be {first}.", False, it["difficulty"], "procedural",
         "symbolic_solver", False,
-        "Backward reasoning affirms the consequent; the reversed conclusion is not entailed.",
+        f"Affirms the consequent: observing '{last}' is consistent with '{first}' being false, so '{last}' does not entail '{first}'. The correct answer is No.",
         "procedural-gen, verified", None, it["_created"],
         notes=f"paired positive: {tid}. Fallacy: affirming the consequent.")
 
@@ -273,7 +277,9 @@ def build_inductive(need, rng, exclude):
                 steps=[(f"Each output applies: {txt}.", "valid"), ("Check shown pairs: consistent.", "valid"),
                        (f"Apply to '{q}': '{fn(q)}'.", "valid")],
                 final=f"'{fn(q)}'", difficulty=2, vm="code_execution",
-                vd=f"Executed the '{nm}' transform on shown inputs and the query; all match."))
+                vd=f"Executed the '{nm}' transform on shown inputs and the query; all match.",
+                neg=dict(kind="str", first_in=shown[0][0], first_out=shown[0][1],
+                         snd_in=shown[1][0], snd_out=shown[1][1], query=q)))
             continue
         kind = rng.choice(["affine","scale","shift","quad","quad2"])
         a = rng.randint(2, 9); b = rng.randint(1, 12) * rng.choice([1, -1])
@@ -308,18 +314,34 @@ def build_inductive(need, rng, exclude):
                    (f"As code: {code}.", "valid"), (f"Apply to {q}: {f(q)}.", "valid"),
                    ("Held-out check " + ", ".join(f"{x}->{y}" for x, y in held) + ": consistent.", "valid")],
             final=final, difficulty=(3 if "quad" in kind else 2 if kind in ("affine","scale") else 1),
-            vm="code_execution", vd=f"Executed {name} on held-out {[x for x,_ in held]}; matched and f({q})={f(q)}."))
+            vm="code_execution", vd=f"Executed {name} on held-out {[x for x,_ in held]}; matched and f({q})={f(q)}.",
+            neg=dict(kind="num", first_in=shown[0][0], first_out=shown[0][1],
+                     snd_in=shown[1][0], snd_out=shown[1][1], query=q)))
     return out
 
 def neg_inductive(tid, it):
+    # Coherent overfit negative: MEMORIZE the first shown example and echo its
+    # output for everything, which fits pair 1 but fails the next pair. Only the
+    # pair-style families (numeric, string) carry `neg`; sequence items skip.
+    n = it.get("neg")
+    if n is None:
+        return None
+    if n["kind"] == "str":
+        fi, fo, si, so, q = (f"'{n['first_in']}'", f"'{n['first_out']}'",
+                             f"'{n['snd_in']}'", f"'{n['snd_out']}'", f"'{n['query']}'")
+        ans = f"'{n['first_out']}'"
+    else:
+        fi, fo, si, so, q = (n["first_in"], n["first_out"], n["snd_in"], n["snd_out"], n["query"])
+        ans = f"{n['first_out']}"
     return make(tid+"-neg", "inductive", it["domain"], it["problem"],
-        [("Fit a rule to only the first shown pair and ignore the rest.", "invalid"),
-         ("Skip the remaining shown pairs and the held-out checks.", "invalid"),
-         ("Report that under-determined rule.", "invalid")],
-        "output = input (overfit)", False, it["difficulty"], "procedural", "code_execution", False,
-        "Executing the overfit rule fails the other shown pairs; rule rejected.",
+        [(f"Look only at the first example, {fi} -> {fo}.", "invalid"),
+         (f"Guess that the output is always {fo}, without checking the other pairs.", "invalid"),
+         (f"So for {q}, answer {fo}.", "invalid")],
+        ans, False, it["difficulty"], "procedural", "code_execution", False,
+        f"Memorizes the first example and returns {fo} regardless of input; this already fails the "
+        f"next shown pair {si} -> {so}. A rule checked against every pair would have been rejected.",
         "procedural-gen, verified", None, it["_created"],
-        notes=f"paired positive: {tid}. Fallacy: overfitting one example.")
+        notes=f"paired positive: {tid}. Fallacy: overfitting/memorizing one example instead of the rule.")
 
 PRB_FRAMINGS = [
     ("medicine-style diagnosis", lambda se,sp,pv: f"A medical test is {se}% sensitive and {sp}% specific for a condition with {pv}% prevalence.", "the person has the condition"),
@@ -483,12 +505,12 @@ def build_causal(need, rng, exclude):
                 out.append(dict(domain=dom, problem=prob,
                     steps=[(f"Observed: {x} and {y} correlate.","valid"),
                            (f"{cap(drv)} raises both, a common cause (confounder).","valid"),
-                           (f"The correlation is explained by {drv}; no direct edge is implied.","valid"),
+                           (f"That common cause already accounts for the correlation, so the co-movement on its own does not establish a direct {x}->{y} link.","valid"),
                            (f"Discriminating test: hold {drv} fixed and vary {x}; watch {y}.","valid"),
-                           (f"Check: if {y} do not move at fixed {drv}, the claim is refuted.","valid")],
-                    final=f"Not supported; {drv} is a confounder. Hold {drv} fixed and vary {x} to test for a direct effect on {y}.",
+                           (f"Check: at fixed {drv}, if {y} still tracks {x} there is a direct effect; if not, the claim is unsupported.","valid")],
+                    final=f"Not supported by this evidence: {drv} is a confounder, so the correlation alone cannot establish that {x} causes {y}. Hold {drv} fixed and vary {x} to test for any direct effect on {y}.",
                     difficulty=3, vm="answer_match",
-                    vd=f"Graph: {drv}->{x}, {drv}->{y}, no {x}->{y} edge. Confounder '{drv}'.", is_conf=True))
+                    vd=f"Modeled common cause: {drv} drives both {x} and {y}, which explains their co-movement; a direct {x}->{y} effect is not established without intervening on {x} at fixed {drv}.", is_conf=True))
     # mediator + direct items
     for cause, eff, med, dom in CAUSAL_MED:
         prob = f"{cap(cause)} is associated with {eff}. The model has no direct arrow; {cause} produces {med}, which produces {eff}. Does {cause} cause {eff}, and how?"
@@ -517,7 +539,7 @@ def neg_causal(tid, it):
          ("Because they move together, one must cause the other.", "invalid"),
          ("Conclude the causal claim is supported.", "invalid")],
         "Yes, the causal claim is supported.", False, it["difficulty"], "procedural", "answer_match", False,
-        "A confounder explains the correlation and there is no direct edge; asserting causation is wrong.",
+        "A common cause already explains the correlation, so concluding causation from co-movement alone is unjustified; the claim is not supported by this evidence.",
         "procedural-gen, verified", None, it["_created"],
         notes=f"paired positive: {tid}. Fallacy: correlation mistaken for causation.")
 
