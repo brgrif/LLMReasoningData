@@ -7,9 +7,12 @@ Reusable tooling for the corpus.
 - `deal_season.py` — the GENERATOR.md dealer. Shuffles the season decks and
   deals one spec per item across the nine diversity dimensions, enforcing the
   composition targets, the no-consecutive-repeat rule, the per-domain cap, and
-  the isomorphism quota. Emits `specs.json` (`{"salt":.., "items":[..]}`) that
-  drives the authoring pass. Change the decks in the file to launch a new
-  season; the run salt is drawn fresh each run. `python deal_season.py specs.json`
+  the isomorphism quota. The decks ship large (~115 surface domains, 26
+  registers, 20 kernels, 11 twists) so per-item collisions stay rare. Emits
+  `specs.json` (`{"salt":.., "items":[..]}`) that drives the authoring pass.
+  Change the decks in the file to launch a new season; the run salt is drawn
+  fresh each run. `python deal_season.py specs.json`. Note: this path produces
+  **pre-gate** candidates for `data/raw/`, not curated records.
 - `validate_batch.py` — validates an authored GENERATOR.md batch against
   SCHEMA.md and its dealt specs, scans the season ban list, and runs the
   end-of-batch near-duplicate self-audit. `python validate_batch.py specs.json
@@ -17,13 +20,12 @@ Reusable tooling for the corpus.
 
 ## generate.py
 
-## generate.py
-
 Produces a batch of new reasoning traces (default 500 per type - a "500-shot"
-batch), verifies the verifiable types by executing their verifier, appends to
-`data/curated/` (and `data/negatives/`), continuing IDs and de-duplicating
-against whatever is already on disk. Every emitted record validates against
-SCHEMA.md.
+batch), verifies the verifiable types by executing their verifier, and appends
+to `data/curated/` (and `data/negatives/`), continuing IDs above the global
+per-type maximum and de-duplicating against whatever is already on disk. Every
+emitted record validates against SCHEMA.md. This is the tool that grows
+`curated/`; the GENERATOR.md path (above) grows only `raw/`.
 
 ### Usage
 
@@ -76,9 +78,14 @@ Difficulty is tagged 1-5 for curriculum ordering.
 - **Bank-limited types:** the authored types (abductive, analogical,
   moral-ethical) draw from `BANK`-marked lists in `generate.py`. When the report
   shows one produced fewer than requested (`<-- SHORT`), extend the relevant
-  bank; the tool never pads a shortfall with duplicates.
-- The tool dedups against existing problems and continues IDs, so re-running is
-  safe and additive.
+  bank; the tool never pads a shortfall with duplicates. The banks were expanded
+  so a full 500-per-type batch is achievable against the current corpus.
+- The tool dedups against existing problems and allocates new IDs above the
+  global per-type maximum (across `curated/`, `raw/`, and `negatives/`), so
+  re-running is safe, additive, and never collides with pre-gate raw candidates.
+- If a type's whole candidate space is already on disk, the report prints
+  `ADDED NOTHING to curated` for it and writes nothing for that type - change
+  `--seed` (parametric types) or extend its `BANK` (authored types) to grow it.
 
 ### Honesty
 
