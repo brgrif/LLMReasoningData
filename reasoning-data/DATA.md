@@ -1,6 +1,6 @@
 # Data
 
-Where the actual datasets live. This defines the on-disk layout, the lifecycle a record moves through, and the invariants each location enforces. The current corpus holds 800 curated examples per reasoning type (640 train / 160 eval, 7,200 total) plus 800 paired negatives for the verifiable types, spanning many domains and several question formats per type.
+Where the actual datasets live. This defines the on-disk layout, the lifecycle a record moves through, and the invariants each location enforces. The current corpus holds 1,300 curated examples per reasoning type (1,040 train / 260 eval, 11,700 total) plus 1,241 paired negatives for the verifiable types, spanning many domains and several question formats per type.
 
 ## Layout
 
@@ -36,12 +36,23 @@ A record moves left to right through the pipeline (PIPELINE.md):
 
 ## Tooling
 
-Batches are produced by `tools/generate.py`, a reusable generator that emits new
-traces (default 500 per type), verifies the verifiable types by executing their
-verifier, dedups against what is already on disk, continues IDs, and appends here.
-It is safe by default (dry run unless `--write`) and reports achievable counts per
-type rather than padding a shortfall. See `tools/README.md`. Change `--seed` for a
-new season; extend the marked banks to grow the authored types.
+Two tools feed this tree, and they land in different places:
+
+- `tools/generate.py` is the procedural/parametric generator. It emits new traces
+  (default 500 per type), verifies the verifiable types by executing their
+  verifier, dedups against what is already on disk, continues IDs above the global
+  per-type maximum (so an appended batch can never collide with a pre-gate raw
+  candidate), and **appends straight to `curated/` and `negatives/`**. It is safe
+  by default (dry run unless `--write`) and reports achievable counts per type
+  rather than padding a shortfall; if every candidate for a type is already on
+  disk it says so instead of silently writing nothing. Change `--seed` for a new
+  season; extend the marked banks to grow the authored types.
+- `tools/deal_season.py` + the GENERATOR.md engine produce diversity-engineered
+  candidates that land in `raw/` as **pre-gate** records. They are not curated
+  until they clear the Solver, Critic, and deterministic gates (PIPELINE.md), so a
+  GENERATOR.md run growing `raw/` does not, by itself, change `curated/`.
+
+See `tools/README.md` for both.
 
 ## Decontamination and derived data
 

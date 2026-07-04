@@ -5,8 +5,10 @@ generate.py - reusable batch generator for the reasoning-data corpus.
 WHAT IT DOES
     Produces a batch of new reasoning traces (default 500 per type - a
     "500-shot" batch), appends them to data/curated/ (and data/negatives/ for
-    the verifiable types), continuing IDs and de-duplicating against whatever
-    is already on disk. Every record it emits validates against SCHEMA.md.
+    the verifiable types), continuing IDs above the global per-type maximum
+    (so an appended batch never collides with a pre-gate raw candidate) and
+    de-duplicating against whatever is already on disk. Every record it emits
+    validates against SCHEMA.md.
 
 DESIGN (why it is built this way)
     The goal of this corpus is a transferable *logical foundation* for LLMs -
@@ -145,24 +147,30 @@ def validate(r, location, canon):
 # Subjects grouped by DOMAINS.md domain -> deductive/metacognitive skin the same
 # formal structure across all of these.
 DOMAIN_SUBJECTS = {
-    "logic puzzles": ["token","tile","marker","card","switch","lever","glyph"],
-    "program behavior": ["record","request","job","event","session","message"],
-    "finance and business operations": ["invoice","transaction","account","order","claim","payment"],
-    "mechanical / systems troubleshooting": ["part","unit","valve","motor","panel","gauge"],
-    "chemistry": ["sample","batch","compound","solution","vial","reagent"],
-    "medicine-style diagnosis": ["chart","specimen","dose","case","scan","sample"],
-    "incident and root-cause analysis": ["alert","ticket","deploy","signal","log entry","trace"],
-    "science": ["reading","measurement","trial","observation","specimen","dataset"],
-    "law and regulation": ["filing","contract","permit","case file","statute","affidavit"],
-    "economics and markets": ["asset","listing","position","order","contract","lot"],
-    "engineering and physical systems": ["beam","circuit","sensor","joint","module","bearing"],
-    "biology and ecology": ["culture","specimen","colony","plot","sample","population"],
-    "formal grammars and symbol systems": ["string","token","symbol","expression","rule","glyph"],
+    "logic puzzles": ["token","tile","marker","card","switch","lever","glyph","peg","cog","dial","rune","chit"],
+    "program behavior": ["record","request","job","event","session","message","packet","thread","handle","socket","token","frame"],
+    "finance and business operations": ["invoice","transaction","account","order","claim","payment","ledger entry","receipt","refund","voucher","remittance","statement"],
+    "mechanical / systems troubleshooting": ["part","unit","valve","motor","panel","gauge","relay","bearing","actuator","coupling","fuse","seal"],
+    "chemistry": ["sample","batch","compound","solution","vial","reagent","aliquot","precipitate","buffer","titrant","isolate","distillate"],
+    "medicine-style diagnosis": ["chart","specimen","dose","case","scan","sample","culture","panel","biopsy","referral","swab","record"],
+    "incident and root-cause analysis": ["alert","ticket","deploy","signal","log entry","trace","incident","page","runbook","postmortem","alarm","span"],
+    "science": ["reading","measurement","trial","observation","specimen","dataset","sample","assay","run","survey","record","probe"],
+    "law and regulation": ["filing","contract","permit","case file","statute","affidavit","motion","brief","subpoena","clause","ordinance","docket"],
+    "economics and markets": ["asset","listing","position","order","contract","lot","bid","quote","tranche","instrument","holding","warrant"],
+    "engineering and physical systems": ["beam","circuit","sensor","joint","module","bearing","strut","node","gasket","conduit","rotor","truss"],
+    "biology and ecology": ["culture","specimen","colony","plot","sample","population","isolate","transect","clutch","graft","strain","quadrat"],
+    "formal grammars and symbol systems": ["string","token","symbol","expression","rule","glyph","lexeme","production","cipher","word","tape","node"],
+    "algorithms and program analysis": ["node","invariant","subroutine","iteration","state","predicate","branch","loop","assertion","register","frame","edge"],
 }
 # Generic state predicates for formal chains (domain-neutral, so any subject fits).
 PREDICATES = ["flagged","queued","archived","approved","sealed","escalated","audited",
               "locked","expired","tagged","routed","verified","quarantined","published",
-              "indexed","frozen","released","logged","signed","cleared","batched","held"]
+              "indexed","frozen","released","logged","signed","cleared","batched","held",
+              "certified","deferred","encrypted","mirrored","notarized","pinned","ranked",
+              "reconciled","redacted","reserved","stamped","suspended","syndicated","throttled",
+              "vaulted","whitelisted","annotated","bonded","chartered","dispatched","embargoed",
+              "endorsed","forwarded","gated","harmonized","impounded","licensed","migrated",
+              "provisioned","ratified","sandboxed","staged","tokenized","triaged","vetted"]
 
 def _domain_subject(rng):
     dom = rng.choice(list(DOMAIN_SUBJECTS))
@@ -225,17 +233,21 @@ def build_deductive(need, rng, exclude):
     return out
 
 def neg_deductive(tid, it):
+    # A proper negative COMMITS the fallacy and reaches the WRONG answer (SCHEMA.md):
+    # given the chain first -> ... -> last, it observes `last` and wrongly concludes
+    # `first` (affirming the consequent), answering "Yes" when the truth is "No".
     subj, preds, hops = it["subj"], it["preds"], it["hops"]
     first, last = preds[0], preds[-1]
     prob = ("Rules: " + " ".join(f"If the {subj} is {preds[i]}, then it is {preds[i+1]}." for i in range(hops))
-            + f" Observed: the {subj} is {last}. Someone concludes it must be {first}. Is that valid?")
+            + f" Observed: the {subj} is {last}. Someone concludes the {subj} must therefore be {first}. Is that inference valid?")
     return make(tid+"-neg", "deductive", it["domain"], prob,
-        [("The premises are as given.", "valid"),
-         (f"They infer '{first}' from '{last}', reversing the implications.", "invalid"),
-         ("This affirms the consequent, an invalid inference.", "invalid")],
-        f"No; concluding '{first}' affirms the consequent.", False, it["difficulty"], "procedural",
+        [(f"Observed: the {subj} is {last}.", "valid"),
+         (f"Read the final rule backward: since '{preds[hops-1]} -> {last}', treat {last} as giving back '{preds[hops-1]}'.", "invalid"),
+         (f"Chain that backward reading to the start and land on '{first}'.", "invalid"),
+         (f"Conclude the {subj} must be {first}.", "invalid")],
+        f"Yes, the {subj} must be {first}.", False, it["difficulty"], "procedural",
         "symbolic_solver", False,
-        "Backward reasoning affirms the consequent; the reversed conclusion is not entailed.",
+        f"Affirms the consequent: observing '{last}' is consistent with '{first}' being false, so '{last}' does not entail '{first}'. The correct answer is No.",
         "procedural-gen, verified", None, it["_created"],
         notes=f"paired positive: {tid}. Fallacy: affirming the consequent.")
 
@@ -265,7 +277,9 @@ def build_inductive(need, rng, exclude):
                 steps=[(f"Each output applies: {txt}.", "valid"), ("Check shown pairs: consistent.", "valid"),
                        (f"Apply to '{q}': '{fn(q)}'.", "valid")],
                 final=f"'{fn(q)}'", difficulty=2, vm="code_execution",
-                vd=f"Executed the '{nm}' transform on shown inputs and the query; all match."))
+                vd=f"Executed the '{nm}' transform on shown inputs and the query; all match.",
+                neg=dict(kind="str", first_in=shown[0][0], first_out=shown[0][1],
+                         snd_in=shown[1][0], snd_out=shown[1][1], query=q)))
             continue
         kind = rng.choice(["affine","scale","shift","quad","quad2"])
         a = rng.randint(2, 9); b = rng.randint(1, 12) * rng.choice([1, -1])
@@ -286,7 +300,8 @@ def build_inductive(need, rng, exclude):
         xs = rng.sample(range(0, 13), 6); shown = [(x, f(x)) for x in xs[:3]]; held = [(x, f(x)) for x in xs[3:5]]; q = xs[5]
         pairs = ", ".join(f"{x}->{y}" for x, y in shown)
         if fmt == 0:
-            prob = f"From these pairs, state the rule and apply it to {q}: {pairs}."; final = f"Rule: {name}. f({q}) = {f(q)}."; dom = "mathematics"
+            prob = f"From these pairs, state the rule and apply it to {q}: {pairs}."; final = f"Rule: {name}. f({q}) = {f(q)}."
+            dom = rng.choice(["mathematics","science","finance and business operations","economics and markets"])
         elif fmt == 1:
             prob = f"A function produces: {pairs}. What does it output for input {q}?"; final = str(f(q)); dom = "program behavior"
         else:
@@ -299,18 +314,34 @@ def build_inductive(need, rng, exclude):
                    (f"As code: {code}.", "valid"), (f"Apply to {q}: {f(q)}.", "valid"),
                    ("Held-out check " + ", ".join(f"{x}->{y}" for x, y in held) + ": consistent.", "valid")],
             final=final, difficulty=(3 if "quad" in kind else 2 if kind in ("affine","scale") else 1),
-            vm="code_execution", vd=f"Executed {name} on held-out {[x for x,_ in held]}; matched and f({q})={f(q)}."))
+            vm="code_execution", vd=f"Executed {name} on held-out {[x for x,_ in held]}; matched and f({q})={f(q)}.",
+            neg=dict(kind="num", first_in=shown[0][0], first_out=shown[0][1],
+                     snd_in=shown[1][0], snd_out=shown[1][1], query=q)))
     return out
 
 def neg_inductive(tid, it):
+    # Coherent overfit negative: MEMORIZE the first shown example and echo its
+    # output for everything, which fits pair 1 but fails the next pair. Only the
+    # pair-style families (numeric, string) carry `neg`; sequence items skip.
+    n = it.get("neg")
+    if n is None:
+        return None
+    if n["kind"] == "str":
+        fi, fo, si, so, q = (f"'{n['first_in']}'", f"'{n['first_out']}'",
+                             f"'{n['snd_in']}'", f"'{n['snd_out']}'", f"'{n['query']}'")
+        ans = f"'{n['first_out']}'"
+    else:
+        fi, fo, si, so, q = (n["first_in"], n["first_out"], n["snd_in"], n["snd_out"], n["query"])
+        ans = f"{n['first_out']}"
     return make(tid+"-neg", "inductive", it["domain"], it["problem"],
-        [("Fit a rule to only the first shown pair and ignore the rest.", "invalid"),
-         ("Skip the remaining shown pairs and the held-out checks.", "invalid"),
-         ("Report that under-determined rule.", "invalid")],
-        "output = input (overfit)", False, it["difficulty"], "procedural", "code_execution", False,
-        "Executing the overfit rule fails the other shown pairs; rule rejected.",
+        [(f"Look only at the first example, {fi} -> {fo}.", "invalid"),
+         (f"Guess that the output is always {fo}, without checking the other pairs.", "invalid"),
+         (f"So for {q}, answer {fo}.", "invalid")],
+        ans, False, it["difficulty"], "procedural", "code_execution", False,
+        f"Memorizes the first example and returns {fo} regardless of input; this already fails the "
+        f"next shown pair {si} -> {so}. A rule checked against every pair would have been rejected.",
         "procedural-gen, verified", None, it["_created"],
-        notes=f"paired positive: {tid}. Fallacy: overfitting one example.")
+        notes=f"paired positive: {tid}. Fallacy: overfitting/memorizing one example instead of the rule.")
 
 PRB_FRAMINGS = [
     ("medicine-style diagnosis", lambda se,sp,pv: f"A medical test is {se}% sensitive and {sp}% specific for a condition with {pv}% prevalence.", "the person has the condition"),
@@ -319,6 +350,10 @@ PRB_FRAMINGS = [
     ("incident and root-cause analysis", lambda se,sp,pv: f"An intrusion detector alerts on {se}% of real attacks and false-alarms on {100-sp}% of normal sessions; {pv}% of sessions are attacks.", "it is a real attack"),
     ("science",                  lambda se,sp,pv: f"A field survey detects a species in {se}% of sites where it lives and gives a false positive in {100-sp}% of sites where it does not; the species is present at {pv}% of sites.", "the species is present"),
     ("finance and business operations", lambda se,sp,pv: f"A fraud screen flags {se}% of fraudulent charges and wrongly flags {100-sp}% of legitimate ones; {pv}% of charges are fraudulent.", "the charge is fraudulent"),
+    ("biology and ecology",      lambda se,sp,pv: f"A genetic assay is positive in {se}% of animals carrying a trait and in {100-sp}% of those without it; {pv}% of the population carries the trait.", "the animal carries the trait"),
+    ("law and regulation",       lambda se,sp,pv: f"A compliance audit flags {se}% of filings that truly breach a rule and {100-sp}% of compliant ones; {pv}% of filings actually breach it.", "the filing breaches the rule"),
+    ("chemistry",                lambda se,sp,pv: f"A spectrometer detects a contaminant in {se}% of tainted batches and reads positive on {100-sp}% of clean ones; {pv}% of batches are tainted.", "the batch is contaminated"),
+    ("engineering and physical systems", lambda se,sp,pv: f"A weld-inspection sensor catches {se}% of cracked joints and false-alarms on {100-sp}% of sound ones; {pv}% of joints are cracked.", "the joint is cracked"),
 ]
 QSTEM_P = ["Given a positive result, what is the probability that {H}?",
            "A positive result comes back. How likely is it that {H}?",
@@ -371,7 +406,8 @@ def build_counterfactual(need, rng, exclude):
     attempts = 0
     while len(out) < need and attempts < need*40 + 3000:
         attempts += 1
-        fam = rng.choice(["fill","cost","area","distance","interest","dosage","recipe","energy"])
+        fam = rng.choice(["fill","cost","area","distance","interest","dosage","recipe","energy",
+                          "voltage","tax","throughput","yield","wage"])
         if fam == "fill":
             r0, r1, t = rng.randint(2,8), rng.randint(9,15), rng.randint(3,8); b, c = r0*t, r1*t
             add(f"A tank fills at {r0} L/min for {t} min, reaching {b} L. If the rate had been {r1} L/min for the same {t} min, "+qc("the volume"),
@@ -408,11 +444,37 @@ def build_counterfactual(need, rng, exclude):
             add(f"A recipe for {serv} servings uses {b} cups of flour. Scaled {fac}x richer for the same {serv} servings, "+qc("the flour"),
                 [("Model: flour = servings*per-serving.","valid"),(f"Baseline: {serv}*{per} = {b}.","valid"),(f"Intervene: per-serving *{fac}. Run: {c}.","valid"),("Check: differs from baseline.","valid")],
                 str(c),2,f"flour scaled {fac}x => {c}.","everyday planning",b)
-        else:  # energy: power * hours
+        elif fam == "energy":  # power * hours
             p0, p1, h = rng.choice([2,3,5]), rng.choice([6,8,10]), rng.choice([4,6,8]); b, c = p0*h, p1*h
             add(f"A heater at {p0} kW ran {h} h, using {b} kWh. At {p1} kW for the same {h} h, "+qc("the energy"),
                 [("Model: energy = power*hours.","valid"),(f"Baseline: {p0}*{h} = {b}.","valid"),(f"Intervene: power={p1}. Run: {c}.","valid"),("Check: differs from baseline.","valid")],
                 str(c),2,f"energy with power={p1} => {c}.","engineering and physical systems",b)
+        elif fam == "voltage":  # Ohm's law: V = I * R
+            I, r0, r1 = rng.choice([2,3,4,5]), rng.choice([3,4,6]), rng.choice([8,10,12,15]); b, c = I*r0, I*r1
+            add(f"A resistor of {r0} ohms carries {I} A, dropping {b} V. If it were {r1} ohms at the same {I} A, "+qc("the voltage"),
+                [("Model: voltage = current*resistance.","valid"),(f"Baseline: {I}*{r0} = {b}.","valid"),(f"Intervene: resistance={r1}. Run: {c}.","valid"),(f"Check: {c} != baseline {b}.","valid")],
+                str(c),3,f"voltage with resistance={r1} => {c}.","engineering and physical systems",b)
+        elif fam == "tax":  # income * rate
+            inc, t0, t1 = rng.choice([20,30,40,50,60]), rng.choice([0.1,0.15]), rng.choice([0.2,0.25,0.3]); b = round(inc*t0,2); c = round(inc*t1,2)
+            bs = str(int(b)) if b==int(b) else f"{b:.2f}"; cs = str(int(c)) if c==int(c) else f"{c:.2f}"
+            add(f"Income of {inc}k taxed at {int(t0*100)}% owes {bs}k. At a {int(t1*100)}% rate on the same {inc}k, "+qc("the tax"),
+                [("Model: tax = income*rate.","valid"),(f"Baseline: {inc}*{t0:g} = {bs}.","valid"),(f"Intervene: rate={t1:g}. Run: {cs}.","valid"),("Check: baseline rate cannot answer.","valid")],
+                cs,3,f"tax with rate={t1:g} => {cs}.","finance and business operations",b)
+        elif fam == "throughput":  # rate * seconds
+            r0, r1, s = rng.choice([20,40,50]), rng.choice([80,100,120]), rng.choice([3,5,8]); b, c = r0*s, r1*s
+            add(f"A service handling {r0} requests/s for {s} s served {b} requests. At {r1} requests/s for the same {s} s, "+qc("the total served"),
+                [("Model: total = rate*seconds.","valid"),(f"Baseline: {r0}*{s} = {b}.","valid"),(f"Intervene: rate={r1}. Run: {c}.","valid"),("Check: differs from baseline.","valid")],
+                str(c),2,f"throughput with rate={r1} => {c}.","program behavior",b)
+        elif fam == "yield":  # plots * per-plot
+            p0, per, p1 = rng.choice([6,8,10,12]), rng.choice([15,20,25]), rng.choice([16,18,20,24]); b, c = p0*per, p1*per
+            add(f"A farm with {p0} plots yielding {per} kg each harvested {b} kg. With {p1} plots at the same {per} kg each, "+qc("the harvest"),
+                [("Model: harvest = plots*per-plot.","valid"),(f"Baseline: {p0}*{per} = {b}.","valid"),(f"Intervene: plots={p1}. Run: {c}.","valid"),("Check: differs from baseline.","valid")],
+                str(c),2,f"harvest with plots={p1} => {c}.","biology and ecology",b)
+        else:  # wage: hours * rate
+            h, w0, w1 = rng.choice([20,30,40]), rng.choice([12,15,18]), rng.choice([22,25,30]); b, c = h*w0, h*w1
+            add(f"A worker paid {w0}/h for {h} h earned {b}. At {w1}/h for the same {h} h, "+qc("the pay"),
+                [("Model: pay = hours*rate.","valid"),(f"Baseline: {h}*{w0} = {b}.","valid"),(f"Intervene: rate={w1}. Run: {c}.","valid"),("Check: differs from baseline.","valid")],
+                str(c),2,f"pay with rate={w1} => {c}.","economics and markets",b)
     return out
 
 def neg_counterfactual(tid, it):
@@ -443,12 +505,12 @@ def build_causal(need, rng, exclude):
                 out.append(dict(domain=dom, problem=prob,
                     steps=[(f"Observed: {x} and {y} correlate.","valid"),
                            (f"{cap(drv)} raises both, a common cause (confounder).","valid"),
-                           (f"The correlation is explained by {drv}; no direct edge is implied.","valid"),
+                           (f"That common cause already accounts for the correlation, so the co-movement on its own does not establish a direct {x}->{y} link.","valid"),
                            (f"Discriminating test: hold {drv} fixed and vary {x}; watch {y}.","valid"),
-                           (f"Check: if {y} do not move at fixed {drv}, the claim is refuted.","valid")],
-                    final=f"Not supported; {drv} is a confounder. Hold {drv} fixed and vary {x} to test for a direct effect on {y}.",
+                           (f"Check: at fixed {drv}, if {y} still tracks {x} there is a direct effect; if not, the claim is unsupported.","valid")],
+                    final=f"Not supported by this evidence: {drv} is a confounder, so the correlation alone cannot establish that {x} causes {y}. Hold {drv} fixed and vary {x} to test for any direct effect on {y}.",
                     difficulty=3, vm="answer_match",
-                    vd=f"Graph: {drv}->{x}, {drv}->{y}, no {x}->{y} edge. Confounder '{drv}'.", is_conf=True))
+                    vd=f"Modeled common cause: {drv} drives both {x} and {y}, which explains their co-movement; a direct {x}->{y} effect is not established without intervening on {x} at fixed {drv}.", is_conf=True))
     # mediator + direct items
     for cause, eff, med, dom in CAUSAL_MED:
         prob = f"{cap(cause)} is associated with {eff}. The model has no direct arrow; {cause} produces {med}, which produces {eff}. Does {cause} cause {eff}, and how?"
@@ -477,7 +539,7 @@ def neg_causal(tid, it):
          ("Because they move together, one must cause the other.", "invalid"),
          ("Conclude the causal claim is supported.", "invalid")],
         "Yes, the causal claim is supported.", False, it["difficulty"], "procedural", "answer_match", False,
-        "A confounder explains the correlation and there is no direct edge; asserting causation is wrong.",
+        "A common cause already explains the correlation, so concluding causation from co-movement alone is unjustified; the claim is not supported by this evidence.",
         "procedural-gen, verified", None, it["_created"],
         notes=f"paired positive: {tid}. Fallacy: correlation mistaken for causation.")
 
@@ -633,8 +695,12 @@ SOURCE = {t: ("hand-authored" if t in {"abductive","analogical","moral-ethical"}
 # --------------------------------------------------------------------------
 # Word / relation / scenario BANKS  (# BANK: extend to scale a type)
 # --------------------------------------------------------------------------
-NAMES = ["Priya","Marcus","Lena","Diego","Aisha","Tomas","Nadia","Ravi","Mei","Omar","Sofia","Jonas","Yuki","Kwame","Ines","Bardia"]
-WORDS = ["cat","door","lamp","river","stone","cloud","piano","glass","tiger","melon","robot","north","amber","field","otter","zebra","quartz","violet","harbor","cactus","ember","willow","comet","ledger"]
+NAMES = ["Priya","Marcus","Lena","Diego","Aisha","Tomas","Nadia","Ravi","Mei","Omar","Sofia","Jonas","Yuki","Kwame","Ines","Bardia",
+         "Anika","Bjorn","Chidi","Dalia","Ewan","Fatima","Goran","Hana","Idris","Juno","Keiko","Lucas","Mira","Nils","Oksana","Pablo",
+         "Rania","Selim","Tariq","Uma","Vikram","Wen","Ximena","Yara","Zane","Amara","Bao","Camille","Darius","Eitan","Freya","Gita"]
+WORDS = ["cat","door","lamp","river","stone","cloud","piano","glass","tiger","melon","robot","north","amber","field","otter","zebra","quartz","violet","harbor","cactus","ember","willow","comet","ledger",
+         "anchor","basil","cobalt","dune","echo","falcon","garnet","hazel","ivory","jade","kelp","lantern","marble","nectar","onyx","pebble","raven","saffron","thistle","umber","vellum","walnut","yonder","zephyr",
+         "beacon","cinder","drift","fjord","gable","hollow","islet","juniper","kernel","lichen","mesa","nimbus","orchard","prairie","reef","spruce","tundra","vortex"]
 
 CAUSAL_DRIVERS = {  # BANK: extend to scale causal (each driver adds C(len,2) confounder pairs)
     "hot weather": (["ice cream sales","swimming-pool visits","air-conditioner use","cold-drink sales","sunscreen sales","beach attendance","fan sales","popsicle sales"], "economics and markets"),
@@ -645,6 +711,16 @@ CAUSAL_DRIVERS = {  # BANK: extend to scale causal (each driver adds C(len,2) co
     "pollen season": (["antihistamine sales","tissue sales","allergy-clinic visits","eye-drop sales","air-purifier sales"], "medicine-style diagnosis"),
     "a heat wave": (["heatstroke ER visits","bottled-water sales","AC-repair calls","pool-chemical sales","dehydration cases"], "medicine-style diagnosis"),
     "exam season": (["campus coffee sales","library occupancy","energy-drink sales","printing-shop demand","late-night food orders"], "economics and markets"),
+    "a drought": (["wildfire-risk alerts","irrigation demand","crop-insurance claims","dust-storm reports","reservoir-refill costs","hay prices"], "science"),
+    "an economic downturn": (["loan defaults","pawnshop traffic","discount-store sales","bankruptcy filings","unemployment claims","gold demand"], "economics and markets"),
+    "a flu outbreak": (["pharmacy visits","school absences","clinic wait times","tissue sales","sick-leave requests","thermometer sales"], "medicine-style diagnosis"),
+    "a major product launch": (["support-ticket volume","server CPU load","social mentions","return requests","checkout errors"], "incident and root-cause analysis"),
+    "a cold snap": (["pipe-burst calls","road-salt use","blanket sales","frostbite ER visits","power demand"], "engineering and physical systems"),
+    "rising fuel prices": (["freight surcharges","carpool sign-ups","staycation bookings","e-bike sales","transit ridership"], "economics and markets"),
+    "wildfire smoke": (["air-purifier sales","asthma-clinic visits","mask sales","indoor-gym attendance","flight delays"], "medicine-style diagnosis"),
+    "a construction boom": (["cement demand","crane-rental rates","hardware-store sales","permit filings","dumpster rentals"], "economics and markets"),
+    "spring bloom": (["beehive activity","pollen counts","nursery sales","lawn-mower use","allergy-clinic visits"], "biology and ecology"),
+    "a regional festival": (["hotel occupancy","rideshare demand","street-vendor sales","parking fines","late-night transit use"], "economics and markets"),
 }
 CAUSAL_MED = [
     ("rain","car skids","a wet road surface","science"),("infection","sweating","a fever","medicine-style diagnosis"),
@@ -653,6 +729,12 @@ CAUSAL_MED = [
     ("smoking","lung damage","accumulated tar","medicine-style diagnosis"),("a software update","fewer crashes","a fixed memory leak","incident and root-cause analysis"),
     ("heavy rain","a flooded basement","a rising water table","incident and root-cause analysis"),("a sugary diet","tooth decay","acid from oral bacteria","medicine-style diagnosis"),
     ("a wage rise","more spending","higher disposable income","economics and markets"),("deforestation","soil erosion","loss of root structure","science"),
+    ("a fever","a rapid pulse","raised metabolic demand","medicine-style diagnosis"),("adding a database index","faster page loads","quicker query response","program behavior"),
+    ("overfishing","a seabird decline","the collapse of their prey stock","biology and ecology"),("a minimum-wage rise","higher menu prices","increased labor cost","economics and markets"),
+    ("a drought","more wildfires","drier vegetation","science"),("caffeine intake","disrupted sleep","delayed melatonin release","medicine-style diagnosis"),
+    ("a factory retooling","fewer defects","tighter process tolerances","incident and root-cause analysis"),("a currency devaluation","rising exports","cheaper goods abroad","economics and markets"),
+    ("regular watering","a taller plant","sustained cell turgor and growth","biology and ecology"),("a firmware patch","longer battery life","a fixed wake-lock bug","mechanical / systems troubleshooting"),
+    ("higher altitude","faster breathing","lower oxygen partial pressure","science"),("a tariff","lower import volume","higher landed cost","economics and markets"),
 ]
 CAUSAL_DIRECT = [
     ("pressing the switch","the light turning on","program behavior"),("adding fertilizer","faster plant growth","science"),
@@ -660,6 +742,11 @@ CAUSAL_DIRECT = [
     ("tightening the valve","the leak stopping","mechanical / systems troubleshooting"),("increasing study hours","a higher exam score","science"),
     ("adding an index","faster query response","program behavior"),("lowering the thermostat","a colder room","engineering and physical systems"),
     ("cutting interest rates","more borrowing","economics and markets"),("applying the brakes","the car slowing","engineering and physical systems"),
+    ("adding a catalyst","a faster reaction","chemistry"),("watering the seedling","its germination","biology and ecology"),
+    ("closing the relay","the pump starting","program behavior"),("raising the dose","a stronger response","medicine-style diagnosis"),
+    ("tightening the bolt","less vibration","mechanical / systems troubleshooting"),("increasing the voltage","a brighter bulb","engineering and physical systems"),
+    ("adding cache","faster responses","program behavior"),("raising the tariff","fewer imports","economics and markets"),
+    ("heating the gas","higher pressure","chemistry"),("pruning the branch","denser regrowth","biology and ecology"),
 ]
 ANA_BANKS = [  # BANK: extend to scale analogical (each item is one leave-one-out target x formats)
     ("animal to the sound it makes","biology and ecology",1,[("dog","bark"),("cat","meow"),("cow","moo"),("duck","quack"),("lion","roar"),("horse","neigh"),("sheep","bleat"),("frog","croak"),("bee","buzz"),("snake","hiss"),("owl","hoot"),("wolf","howl"),("pig","oink"),("crow","caw"),("hen","cluck")]),
@@ -680,6 +767,17 @@ ANA_BANKS = [  # BANK: extend to scale analogical (each item is one leave-one-ou
     ("animal to its habitat","biology and ecology",2,[("fish","water"),("camel","desert"),("polar bear","the arctic"),("monkey","jungle"),("mole","underground"),("frog","pond"),("lion","savanna"),("penguin","antarctica"),("bat","cave"),("whale","ocean"),("owl","forest"),("crab","shore")]),
     ("whole to one of its parts","engineering and physical systems",2,[("car","wheel"),("tree","branch"),("book","page"),("house","room"),("body","limb"),("computer","keyboard"),("bicycle","pedal"),("clock","hand"),("guitar","string"),("flower","petal"),("ship","deck"),("phone","screen")]),
     ("process to its product","science",2,[("photosynthesis","glucose"),("combustion","heat"),("digestion","nutrients"),("evaporation","vapor"),("fermentation","alcohol"),("erosion","sediment"),("condensation","water"),("respiration","energy"),("baking","bread"),("smelting","metal"),("distillation","spirit"),("weathering","soil")]),
+    ("number to its square","mathematics",1,[("2","4"),("3","9"),("4","16"),("5","25"),("6","36"),("7","49"),("8","64"),("9","81"),("10","100"),("11","121"),("12","144"),("13","169")]),
+    ("shape to its number of sides","mathematics",1,[("triangle","3"),("square","4"),("pentagon","5"),("hexagon","6"),("heptagon","7"),("octagon","8"),("nonagon","9"),("decagon","10"),("quadrilateral","4"),("dodecagon","12")]),
+    ("programming construct to its purpose","program behavior",2,[("loop","repetition"),("function","reuse"),("variable","storage"),("conditional","branching"),("array","indexed collection"),("pointer","indirection"),("exception","error handling"),("comment","documentation"),("constant","fixed value"),("recursion","self-reference")]),
+    ("legal area to what it governs","law and regulation",3,[("tort law","civil injuries"),("contract law","agreements"),("criminal law","offenses"),("property law","ownership"),("family law","domestic relations"),("tax law","levies"),("labor law","employment"),("maritime law","shipping"),("patent law","inventions"),("constitutional law","state powers")]),
+    ("chemical formula to its common name","chemistry",2,[("NaCl","salt"),("H2O","water"),("CO2","carbon dioxide"),("CH4","methane"),("NH3","ammonia"),("O2","oxygen"),("C6H12O6","glucose"),("NaHCO3","baking soda"),("H2O2","hydrogen peroxide"),("CaCO3","limestone")]),
+    ("planet to its order from the sun","science",2,[("Mercury","first"),("Venus","second"),("Earth","third"),("Mars","fourth"),("Jupiter","fifth"),("Saturn","sixth"),("Uranus","seventh"),("Neptune","eighth")]),
+    ("currency to its country","economics and markets",2,[("yen","Japan"),("pound","Britain"),("rupee","India"),("peso","Mexico"),("won","South Korea"),("real","Brazil"),("rand","South Africa"),("lira","Turkey"),("baht","Thailand"),("zloty","Poland")]),
+    ("metric prefix to its factor","science",2,[("kilo","thousand"),("mega","million"),("giga","billion"),("milli","thousandth"),("micro","millionth"),("nano","billionth"),("centi","hundredth"),("deci","tenth"),("tera","trillion"),("hecto","hundred")]),
+    ("verb to its past tense","formal grammars and symbol systems",2,[("go","went"),("run","ran"),("eat","ate"),("see","saw"),("take","took"),("buy","bought"),("bring","brought"),("teach","taught"),("think","thought"),("catch","caught"),("build","built"),("sing","sang")]),
+    ("sport to its playing surface","social situations",2,[("soccer","pitch"),("tennis","court"),("ice hockey","rink"),("golf","course"),("baseball","diamond"),("bowling","lane"),("swimming","pool"),("boxing","ring"),("cricket","pitch"),("track","oval")]),
+    ("data structure to its access pattern","algorithms and program analysis",3,[("stack","last-in first-out"),("queue","first-in first-out"),("array","random access"),("linked list","sequential access"),("hash map","key lookup"),("heap","priority order"),("binary search tree","sorted traversal"),("graph","adjacency")]),
 ]
 # ABD_BANK: (domain, subject, [ (distinguishing-signature, planted-cause, [(alt, why-ruled-out), ...]) ])
 # BANK: extend to scale abductive.
@@ -745,6 +843,36 @@ ABD_BANK = [
  ("incident and root-cause analysis","a dashboard with wrong numbers",[("off since a timezone config change","a timezone mismatch shifting the window",[("data loss","shifted not missing"),("query bug","began with config")]),("one metric doubled overnight","double-counting from a duplicated source",[("growth","implausibly exact"),("timezone","one metric")])]),
  ("mechanical / systems troubleshooting","a wifi connection dropping",[("only when the microwave runs","2.4GHz interference",[("ISP","tracks the microwave"),("router","works otherwise")]),("for far devices only","weak signal at range",[("interference","distance-linked"),("account","near devices fine")])]),
  ("medicine-style diagnosis","a person feeling faint in heat",[("after standing in a hot queue","heat and blood pooling",[("cardiac","clear heat trigger"),("infection","no fever")]),("with heavy sweating and cramps","heat exhaustion from fluid loss",[("faint alone","cramps present"),("virus","exertional/heat context")])]),
+ ("finance and business operations","a monthly budget overrun",[("only in the travel line after a policy change","looser travel-approval rules",[("fraud","tracks the policy"),("price rises","confined to one line")]),("across all lines since a vendor switch","higher unit costs from the new vendor",[("one-off","it persists"),("volume","costs rose, not counts")])]),
+ ("program behavior","a function returning wrong output",[("only for empty input","an unhandled empty-case branch",[("all inputs","only empty fails"),("type error","valid inputs work")]),("only for very large input","an overflow or precision limit",[("logic bug","small inputs pass"),("memory fault","values wrong, no crash")])]),
+ ("program behavior","a web page loading slowly",[("only the first visit per session","a cold cache warming up",[("server load","later loads are fast"),("network","repeat visits are quick")]),("slow for everyone right after a deploy","a regression in the new build",[("cache","all users are slow"),("traffic","tied to the deploy")])]),
+ ("engineering and physical systems","a bridge strain sensor drifting",[("drifting with the daily temperature cycle","thermal expansion of the mount",[("real load","it tracks temperature"),("fault","cyclic, not random")]),("a sudden step then steady","a knock that reseated the sensor",[("thermal","the change was abrupt"),("load","a step, not a ramp")])]),
+ ("chemistry","a reaction not proceeding",[("the mixture stays cold and unchanged","a missing catalyst",[("wrong reagent","components are correct"),("temperature","added heat still stalls it")]),("it bubbles then stops early","a limiting reagent exhausted",[("catalyst","it did start"),("contamination","the start was clean")])]),
+ ("science","a pendulum clock keeping poor time",[("running slow on hot days","a rod lengthened by heat",[("amplitude","temperature-linked"),("pivot","gradual with heat")]),("suddenly erratic after a bump","a loosened pivot",[("heat","the onset was abrupt"),("air current","tied to the bump")])]),
+ ("biology and ecology","a beehive losing workers",[("a sudden collapse after nearby spraying","pesticide exposure",[("mites","tied to the spraying"),("queen loss","brood is present")]),("a gradual decline with mite specks","a mite infestation",[("pesticide","no spray event"),("poor forage","the specks are visible")])]),
+ ("medicine-style diagnosis","a patient with recurring headaches",[("every morning, easing by noon, with loud snoring","disrupted sleep from apnea",[("tumor","clear time-of-day pattern"),("dehydration","morning-specific")]),("with jaw clicking and worse when chewing","a jaw-joint disorder",[("migraine","chewing-linked"),("sinus","localized to the jaw")])]),
+ ("incident and root-cause analysis","orders failing to ship",[("only from one warehouse","a local system or stock issue there",[("carrier","other sites ship"),("payment","paid orders are stuck")]),("for all sites since an address-format change","a validation rejecting the new format",[("one site","all sites affected"),("carrier","it fails before handoff")])]),
+ ("mechanical / systems troubleshooting","a refrigerator not cooling",[("the compressor runs constantly, warm inside","a refrigerant leak",[("no power","it runs"),("door seal","it runs nonstop")]),("it clicks periodically but never starts","a failed start relay",[("refrigerant","it never runs"),("thermostat","the clicks are start attempts")])]),
+ ("social situations","a friend suddenly distant",[("only since you cancelled plans twice","hurt over the cancellations",[("just busy","timing matches the cancellations"),("unrelated","tied to your actions")]),("withdrawn from everyone after a job loss","personal stress unrelated to you",[("you specifically","it is group-wide"),("anger at you","stress, not blame")])]),
+ ("social situations","a team's morale dropping",[("since a well-liked lead left","the loss of trusted leadership",[("pay","tied to the departure"),("workload","began with the exit")]),("only in one sub-team after a reorg","friction from the new structure",[("company-wide","confined to one team"),("season","tied to the reorg")])]),
+ ("narrative and discourse","a novel's abrupt tone shift",[("the prose style changing midway and never returning","a co-author or ghostwriter took over",[("intended device","no in-story trigger"),("editing","persistent, not local")]),("only in the flashback chapters","a deliberate device marking the past",[("author change","confined to flashbacks"),("error","a consistent pattern")])]),
+ ("narrative and discourse","a witness account that will not add up",[("consistent times but an impossible route","an honest mistake about location",[("lying","other details check out"),("coercion","no sign of pressure")]),("every detail conveniently exonerating them","a rehearsed, self-serving story",[("the plain truth","it is too tidy"),("memory","selective in one direction")])]),
+ ("science","a rain gauge reading too low",[("consistently under a nearby station","an obstructed or sheltered site",[("a real dry spell","only this gauge differs"),("calibration","siting explains it")]),("suddenly zero after a storm","a clogged funnel",[("no rain","the station logged rain"),("siting","the onset was abrupt")])]),
+ ("medicine-style diagnosis","a child with a recurring stomachache",[("on school mornings, gone on weekends","stress or school avoidance",[("infection","weekend-free"),("diet","calendar-linked")]),("after dairy meals with bloating","lactose intolerance",[("stress","food-timed"),("appendicitis","it recurs benignly")])]),
+ ("incident and root-cause analysis","a metrics dashboard flatlining",[("one metric flat since an agent update","that metric's collector broke",[("a real drop","other metrics are normal"),("outage","the app is healthy")]),("all metrics flat overnight","the ingestion pipeline stalled",[("one collector","everything is flat"),("display bug","no data is arriving")])]),
+ ("mechanical / systems troubleshooting","a drone drifting in flight",[("always drifting the same direction","a miscalibrated compass or trim",[("wind","consistent direction indoors"),("motor","steady, not erratic")]),("drifting only in gusts","a normal response to wind",[("calibration","gust-linked"),("sensor","an external cause")])]),
+ ("engineering and physical systems","a solar array underperforming",[("output dipping only when one panel is shaded","shading dragging down the string",[("inverter","shade-linked"),("wiring","it tracks the sun")]),("a gradual decline over months","dust or soiling on the panels",[("shading","slow and uniform"),("inverter","lower output, no faults")])]),
+ ("chemistry","a solution changing color unexpectedly",[("only after air exposure","oxidation of a component",[("contamination","air-linked"),("temperature","exposure-timed")]),("only under the lab lights","a light-sensitive photoreaction",[("air","light-linked"),("heat","it tracks illumination")])]),
+ ("biology and ecology","a fish tank clouding overnight",[("days after a fresh setup","a bacterial bloom while cycling",[("overfeeding","setup-timed"),("algae","it is not green")]),("a green tint under strong light","an algae bloom",[("bacteria","green and light-linked"),("waste","it tracks the light")])]),
+ ("finance and business operations","a sudden drop in daily sales",[("only online since a checkout change","a broken checkout flow",[("demand","stores are steady"),("season","tied to the change")]),("across all channels after a price rise","reduced demand at the new price",[("checkout","in-store is also down"),("supply","price-timed")])]),
+ ("program behavior","intermittent test failures",[("only when tests run in parallel","a shared-state race condition",[("logic bug","it passes serially"),("environment","order-dependent")]),("only on the CI machine","an environment or timezone difference",[("flakiness","it is consistent on CI"),("code","it passes locally")])]),
+ ("medicine-style diagnosis","an athlete's dropping performance",[("with breathlessness and pale gums","anemia",[("overtraining","the physical signs"),("diet alone","pallor points to iron")]),("only in heat with heavy sweat","dehydration and heat strain",[("anemia","heat-specific"),("illness","no fever")])]),
+ ("incident and root-cause analysis","a spike in cart abandonment",[("only on mobile after a redesign","a broken mobile checkout step",[("price","desktop is steady"),("season","tied to the redesign")]),("across devices at one step","a surprise fee added at that step",[("mobile bug","all devices affected"),("outage","the site works")])]),
+ ("narrative and discourse","an essay that loses coherence",[("in one section dense with jargon","padding over a weak argument",[("the topic","it is localized"),("style","only where evidence is thin")]),("throughout after a strong opening","preparation that ran out",[("one section","the decline is global"),("editing","it degrades with length")])]),
+ ("social situations","a punctual colleague arriving late",[("only since a change on their commute line","a new transit constraint",[("motivation","external timing"),("illness","tied to the schedule")]),("with fatigue and a short temper","personal stress at home",[("the commute","behavioral signs"),("laziness","distress, not choice")])]),
+ ("mechanical / systems troubleshooting","a car that stalls at idle",[("only when cold, fine once warm","a faulty cold-idle control",[("fuel","fine when warm"),("battery","it starts")]),("stalling with the AC on","an electrical load the idle cannot hold",[("cold-idle","load-linked"),("fuel","AC-specific")])]),
+ ("engineering and physical systems","a motor overheating",[("only under heavy load","cooling undersized for the load",[("bearing","load-linked"),("power","normal when light")]),("hot even at idle","a failing bearing adding friction",[("load","hot at idle too"),("cooling","present at no load")])]),
+ ("chemistry","a pH meter reading off",[("drifting after long use between calibrations","electrode drift needing recalibration",[("real change","it tracks time since calibration"),("temperature","gradual, not stepped")]),("wildly wrong right after storage","a dried-out or fouled electrode",[("drift","the error is large and sudden"),("sample","other samples read wrong too")])]),
 ]
 # MORAL_BANK: (scenario, framework-A, framework-B).  BANK: extend to scale moral-ethical.
 MORAL_BANK = [
@@ -861,6 +989,46 @@ MORAL_BANK = [
  ("A doctor can perform a procedure a patient wants but does not need.","autonomy","avoiding needless risk"),
  ("A regulator can approve a drug faster with thinner evidence in a crisis.","speed that saves lives","safety and rigor"),
  ("A teacher can lower standards to keep struggling students enrolled.","access and encouragement","the value of the credential"),
+ ("A hospital can publish surgeon-level success rates that may deter them from hard cases.","patient transparency","fair incentives to treat the sickest"),
+ ("An editor can run a correct but unverifiable tip from an anonymous source.","the public's right to timely truth","verification and accountability"),
+ ("A city can install speed cameras that fine mostly low-income commuters.","fewer road deaths","fairness to those least able to pay"),
+ ("A manager can read an employee's work chat logs after a leak.","protecting the company","worker privacy and trust"),
+ ("A doctor can enroll a dying patient in a trial that mostly helps future patients.","advancing treatment for many","the patient's own best interest"),
+ ("A charity can spend on lobbying that could unlock far larger public funding.","greater long-run impact","donor intent for direct aid"),
+ ("A startup can keep a dark-pattern cancel flow that boosts retention.","revenue that sustains the product","honest, easy user choice"),
+ ("A scientist can share raw data that could be misread to cause public panic.","open science and transparency","preventing foreseeable harm"),
+ ("A parent can vaccinate a child over the other parent's objection.","the child's and public health","shared parental authority"),
+ ("A judge can impose a lighter sentence to spare a defendant's dependent children.","mercy and the children's welfare","equal treatment under law"),
+ ("A firm can relocate a polluting plant to a poorer region with weaker rules.","jobs and lower costs","environmental justice"),
+ ("A coach can bench a star to enforce a team rule before a crucial match.","consistent discipline","the team's chance to win"),
+ ("A nurse can override a doctor's order she believes will harm a patient.","patient safety","the chain of clinical authority"),
+ ("A landlord can rent to the highest bidder over a long-waiting local family.","efficient use of property","community and fairness"),
+ ("A developer can ship an accessibility-poor app on time or delay for inclusion.","meeting commitments to most users","equal access for disabled users"),
+ ("A government can release a prisoner early to ease overcrowding.","humane conditions and cost","public safety and the sentence served"),
+ ("A biographer can honor a subject's request to omit a formative scandal.","the subject's dignity and wishes","a truthful record"),
+ ("A teacher can let a gifted student skip ahead, straining the class's cohesion.","the student's potential","the group's shared progress"),
+ ("A company can use a customer's data to prevent a likely fraud against them.","protecting the customer","consent and data limits"),
+ ("A pilot can fly through marginal weather to avoid stranding passengers.","meeting travelers' needs","an ample safety margin"),
+ ("A regulator can grandfather an unsafe-by-modern-standards but widely used product.","stability and avoiding disruption","holding all products to current safety"),
+ ("A parent can donate a child's college fund to save many lives abroad.","the greater good for strangers","a specific promise to one's child"),
+ ("A manager can quietly counteroffer to keep a leaving employee, unsettling peers' pay.","retaining key talent","pay fairness across the team"),
+ ("A city can use eminent domain for a park that serves thousands.","broad public benefit","the rights of displaced owners"),
+ ("A doctor can respect a teenager's wish to keep a diagnosis from strict parents.","the young patient's trust","the parents' role and rights"),
+ ("A firm can automate content moderation, cutting jobs but reducing worker trauma.","protecting workers from harm","the livelihoods lost"),
+ ("A scientist can accept industry funding that speeds vital research but risks bias.","faster progress","the integrity of the findings"),
+ ("A teacher can report suspected but unproven cheating that could end a scholarship.","academic integrity","the cost of a false accusation"),
+ ("A platform can down-rank a truthful post that is fueling a dangerous panic.","reducing real-world harm","not suppressing true speech"),
+ ("A hospital can prioritize vaccinating staff over higher-risk patients.","keeping the system running","protecting the most vulnerable first"),
+ ("A parent can let a child face a natural consequence that will hurt but teach.","long-term growth","preventing present harm"),
+ ("A firm can honor a mistaken low price it advertised to thousands.","honesty and goodwill","fairness to the business and its staff"),
+ ("A mayor can divert flood defenses to protect a dense downtown over scattered farms.","protecting the most people","not sacrificing a minority's homes"),
+ ("A researcher can withhold a method that is beneficial but easily weaponized.","preventing misuse","open access that also helps defenders"),
+ ("A worker can unionize quietly, risking a struggling employer that treats them well.","collective bargaining rights","loyalty to a fair employer in hardship"),
+ ("A doctor can give a scarce bed to a patient more likely to recover.","maximizing lives saved","equal claim regardless of prognosis"),
+ ("A parent can enroll a shy child in intensive therapy against the child's protest.","the child's future wellbeing","the child's present autonomy"),
+ ("A company can keep selling a safe product in a market that misuses it culturally.","respecting a lawful market","responsibility for foreseeable misuse"),
+ ("A teacher can spend limited time on the few failing students or the many average ones.","lifting those most at risk","the greatest total gain"),
+ ("A city can name a whistleblower in records requests as the law seems to require.","legal transparency","protecting someone who exposed wrongdoing"),
 ]
 
 # --------------------------------------------------------------------------
@@ -868,7 +1036,11 @@ MORAL_BANK = [
 # --------------------------------------------------------------------------
 def load_corpus(data_dir):
     existing = {t: set() for t in RT}
-    max_train = {t: 999 for t in RT}; max_eval = {t: 4999 for t in RT}
+    # Global next-id per type. New records are numbered above the highest id
+    # seen anywhere in the corpus - train, eval, raw, AND negatives - so an
+    # appended batch can never collide with a pre-gate raw candidate id (raw
+    # batches continue the same numeric run) or any other file.
+    max_id = {t: 999 for t in RT}
     counts = {t: {"train": 0, "eval": 0, "neg": 0} for t in RT}
     for f in glob.glob(os.path.join(data_dir, "**", "*.jsonl"), recursive=True):
         loc = "eval" if ".eval." in f else "train" if ".train." in f else "neg" if os.sep+"negatives"+os.sep in f else "other"
@@ -877,12 +1049,10 @@ def load_corpus(data_dir):
             if not line: continue
             r = json.loads(line); t = r["reasoning_type"]; existing[t].add(r["problem"])
             if loc in counts[t]: counts[t][loc] += 1
-            m = re.match(r'^[a-z]{3}-(\d{6})$', r["id"])
+            m = re.match(r'^[a-z]{3}-(\d{6})(?:-neg)?$', r["id"])
             if m:
-                num = int(m.group(1))
-                if ".eval." in f: max_eval[t] = max(max_eval[t], num)
-                elif ".train." in f: max_train[t] = max(max_train[t], num)
-    return existing, max_train, max_eval, counts
+                max_id[t] = max(max_id[t], int(m.group(1)))
+    return existing, max_id, counts
 
 # --------------------------------------------------------------------------
 # Main
@@ -903,7 +1073,7 @@ def main():
 
     data_dir = os.path.join(args.root, "data")
     canon = load_canonical_domains(args.root)
-    existing, max_train, max_eval, counts = load_corpus(data_dir)
+    existing, max_id, counts = load_corpus(data_dir)
 
     if args.report_only:
         print("Current corpus:")
@@ -920,13 +1090,13 @@ def main():
         chosen = pool[:produced]
         n_eval = int(round(produced * (1 - args.train_frac)))
         n_train = produced - n_eval
-        tstart = max_train[t] + 1; estart = max_eval[t] + 1
+        gid = max_id[t] + 1          # single rising counter, above every existing id
         pre = PREFIX[t]; new_train = []
         doms = set()
         for i, it in enumerate(chosen):
             it["_created"] = args.created
             split = "train" if i < n_train else "eval"
-            num = (tstart + i) if split == "train" else (estart + (i - n_train))
+            num = gid + i
             rid = f"{pre}-{num:06d}"
             rec = make(rid, t, it["domain"], it["problem"], it["steps"], it["final"], True, it["difficulty"],
                        GEN_METHOD[t], it["vm"], True, it["vd"], SOURCE[t], None, args.created, confidence=it.get("confidence"))
@@ -956,9 +1126,17 @@ def main():
         if made < req: short.append(t)
         print(f"{t:16s} {req:4d} {made:4d} {tr:5d} {ev:4d} {ng:4d} {dm:7d}{flag}")
     total = sum(len(v) for v in new_files.values())
+    curated_added = sum(tr + ev for _, _, _, tr, ev, _, _ in report)
+    neg_added = sum(ng for _, _, _, _, _, ng, _ in report)
+    zero = [t for t, _, _, tr, ev, _, _ in report if tr + ev == 0]
     print(f"\nnew records this batch: {total} (seed={args.seed}, created={args.created})")
+    print(f"  curated positives: +{curated_added}    paired negatives: +{neg_added}")
     if short:
         print("bank-limited types (produced < requested):", ", ".join(short))
+    if zero:
+        print("ADDED NOTHING to curated (every candidate already on disk). For a "
+              "parametric type change --seed; for an authored type extend its BANK:",
+              ", ".join(zero))
 
     if not args.write:
         print("\nDRY RUN - nothing written. Re-run with --write to append.")
