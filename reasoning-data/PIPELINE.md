@@ -4,7 +4,7 @@ How data is generated and filtered at scale, without human annotation of every e
 
 ## The three roles
 
-1. **Generator agent.** Given a structural template for a reasoning type and a difficulty level (e.g. deductive at depth 4), the Generator writes the natural-language problem, the step-by-step trace, and the final answer. It works from structure outward, so difficulty is controlled by the template, not guessed.
+1. **Generator agent.** Given a structural template for a reasoning type and a difficulty level (e.g. deductive at depth 4), the Generator writes the natural-language problem, the step-by-step trace, and the final answer. It works from structure outward, so difficulty is controlled by the template, not guessed. Its operating prompt, including the diversity engine and per-season seed decks, is GENERATOR.md.
 
 2. **Solver agent.** A separate model attempts the problem blind: no hints, no access to the Generator's trace, only the problem statement. If the Solver cannot solve it, or the problem admits more than one reading, the item is discarded or returned to the Generator for revision. This step guarantees a clean, unambiguous solution path and filters out problems that are underspecified or accidentally impossible.
 
