@@ -17,6 +17,13 @@ Reusable tooling for the corpus.
   SCHEMA.md and its dealt specs, scans the season ban list, and runs the
   end-of-batch near-duplicate self-audit. `python validate_batch.py specs.json
   data/raw/'*.raw.jsonl'`. Exits non-zero on any record error.
+- `audit_reasoning_types.py` — read-only curated split audit for the rewrite
+  planning pass. It reports train/eval leakage, structural-signature + answer
+  leakage, distinct trace-step text counts, difficulty and domain coverage,
+  generation/provenance/verification labels, and spot-check metadata without
+  generating or writing data. Example: `python tools/audit_reasoning_types.py
+  --types deductive inductive abductive causal counterfactual probabilistic
+  metacognitive moral-ethical`.
 
 ## generate.py
 

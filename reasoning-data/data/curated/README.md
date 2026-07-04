@@ -23,3 +23,20 @@ Analogical was rebuilt for cross-domain transfer, which is the type's whole poin
 3. **Single-relation completion (difficulty 1-3).** Foundational relation induction across ~35 relations with explicit role labels; traces show the actual mapping, not boilerplate. Each analogy appears once, with the phrasing rotated across items for format variety without duplication.
 
 Anti-memorization: train and eval draw from disjoint answer pools; whole relations, whole trap-skins, and held-out target systems/domains are reserved for eval, so eval measures applying a known structure to a *new* domain, not recall. Difficulty spans 1-5 in both splits (39% of train is difficulty 3+), across 19 of the 20 canonical domains. Reproduce with `python tools/generate.py --only analogical --replace --write` (deterministic).
+
+## Audit before generator rewrites
+
+Before rebuilding any non-analogical reasoning type, run the read-only split
+audit so the rewrite has concrete before/after numbers and no new data is
+created during the audit phase:
+
+```
+python tools/audit_reasoning_types.py --types deductive inductive abductive causal counterfactual probabilistic metacognitive moral-ethical
+```
+
+The audit reports exact train/eval problem overlap, first-step/answer and
+structural-signature/answer leakage, distinct step text counts by trace index,
+difficulty coverage (including whether levels 4/5 are absent), canonical-domain
+coverage, generation/provenance/verification labels, and a small spot-check
+metadata sample. Use those numbers as the baseline for the one-type-at-a-time
+rewrite acceptance checks.
