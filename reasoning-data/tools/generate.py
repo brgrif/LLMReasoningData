@@ -1173,22 +1173,41 @@ def _mk_abd_localize(dom, stages, jfail, distract, split):
         difficulty=diff, confidence=0.8, vm="answer_match", split=split,
         vd=f"Localized to the {faulty} (stage {jfail+1}): upstream OK, downstream starved; earliest anomalous stage.")
 
+# Component names for fault-localization: adjective x noun -> realistic, distinct
+# stage names. Eval reserves the last 3 adjectives, so every eval component name
+# (hence every eval fault-answer) is disjoint from train.
+ABD_ADJ = ["intake", "primary", "secondary", "upstream", "relief", "bypass", "main", "auxiliary",
+           "inlet", "outlet", "control", "feed", "return", "pilot", "booster", "trim", "isolation", "purge"]
+ABD_NOUN = ["valve", "pump", "filter", "sensor", "regulator", "manifold", "coupling", "relay",
+            "gate", "module", "junction", "buffer", "compressor", "exchanger", "actuator", "condenser"]
+ABD_LOC_DOMS = ["engineering and physical systems", "mechanical / systems troubleshooting",
+                "program behavior", "incident and root-cause analysis", "chemistry",
+                "biology and ecology", "science", "finance and business operations",
+                "algorithms and program analysis", "economics and markets",
+                "law and regulation", "everyday planning"]
+def _abd_parts(adjs, rng, n):
+    return [f"{rng.choice(adjs)} {rng.choice(ABD_NOUN)}" for _ in range(n * 3)]
+
 def _abductive_eval(seen):
-    """Held-out eval: reserved bank entries (last 6) + reserved per-domain
-    component slices + an eval-only stem -> disjoint problems and answers."""
+    """Held-out eval: reserved bank entries (last 6) + reserved component adjectives
+    + an eval-only stem -> disjoint problems and answers."""
     out = []
     def add(it):
         if it and it["problem"] not in seen:
             seen.add(it["problem"]); out.append(it)
     for (dom, subject, sig, cause, alts) in _abd_bank_bases(ABD_BANK[-6:]):
         add(_mk_abd_rank(dom, subject, sig, cause, alts, Q_ABD_EVAL[0], "eval"))
-    for dom, subs in DOMAIN_SUBJECTS.items():
-        ev = subs[-4:]
-        for n in (3, 4):
-            stages = ev[:n]
-            if len(stages) < n: continue
-            for jfail in (0, n - 1):
-                add(_mk_abd_localize(dom, stages, jfail, jfail == n - 1, "eval"))
+    ev_adj = ABD_ADJ[-3:]
+    idx = 0
+    for a in ev_adj:
+        for nz in ABD_NOUN:
+            for n in (3, 4):
+                stages = [f"{a} {ABD_NOUN[(idx + k) % len(ABD_NOUN)]}" for k in range(n)]
+                if len({*stages}) < n:
+                    idx += 1; continue
+                jfail = idx % n
+                add(_mk_abd_localize(ABD_LOC_DOMS[idx % len(ABD_LOC_DOMS)], stages, jfail, jfail < n - 1, "eval"))
+                idx += 1
     return out
 
 def build_abductive(need, rng, exclude):
@@ -1203,17 +1222,20 @@ def build_abductive(need, rng, exclude):
         if it["problem"] not in seen:
             seen.add(it["problem"]); out.append(it)
     made = sum(1 for it in out if it.get("split") == "train")
-    # volume layer: parametric fault-localization with genuinely different answers
-    dom_pool = [(d, s[:-4]) for d, s in DOMAIN_SUBJECTS.items() if len(s) >= 7]
+    # volume layer: parametric fault-localization over compound component names
+    # (train adjectives only -> answers disjoint from the reserved eval set).
+    train_adj = ABD_ADJ[:-3]
     attempts = 0
     while made < need and attempts < need * 60 + 5000:
         attempts += 1
-        dom, subs = rng.choice(dom_pool)
-        n = rng.randint(2, 5)
-        if len(subs) < n: continue
-        stages = rng.sample(subs, n)
+        n = rng.randint(2, 6)
+        parts = list(dict.fromkeys(_abd_parts(train_adj, rng, n)))   # distinct, order-preserving
+        if len(parts) < n:
+            continue
+        stages = parts[:n]
         jfail = rng.randrange(n)
         distract = rng.random() < 0.4 and jfail < n - 1
+        dom = ABD_LOC_DOMS[attempts % len(ABD_LOC_DOMS)]
         it = _mk_abd_localize(dom, stages, jfail, distract, "train")
         if it["problem"] in seen:
             continue
