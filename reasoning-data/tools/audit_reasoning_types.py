@@ -39,6 +39,15 @@ def load_jsonl(path: Path):
     return rows
 
 
+def load_split(curated: Path, reasoning_type: str, split: str):
+    """Load a split across all shards: {type}.{split}.jsonl plus any
+    {type}.{split}.NNN.jsonl continuation shards."""
+    rows = load_jsonl(curated / f"{reasoning_type}.{split}.jsonl")
+    for shard in sorted(curated.glob(f"{reasoning_type}.{split}.[0-9][0-9][0-9].jsonl")):
+        rows.extend(load_jsonl(shard))
+    return rows
+
+
 def norm_text(value):
     return re.sub(r"\s+", " ", str(value).strip().lower())
 
@@ -76,8 +85,8 @@ def spot_checks(records, limit=5):
 
 def audit_one(root: Path, reasoning_type: str):
     curated = root / "data" / "curated"
-    train = load_jsonl(curated / f"{reasoning_type}.train.jsonl")
-    eval_ = load_jsonl(curated / f"{reasoning_type}.eval.jsonl")
+    train = load_split(curated, reasoning_type, "train")
+    eval_ = load_split(curated, reasoning_type, "eval")
     train_problems = collections.Counter(norm_text(r.get("problem", "")) for r in train)
     eval_problems = collections.Counter(norm_text(r.get("problem", "")) for r in eval_)
     exact_overlap = sorted(set(train_problems) & set(eval_problems))

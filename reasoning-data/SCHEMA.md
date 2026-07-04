@@ -4,6 +4,8 @@ This file is the single source of truth for the data format. Every record in eve
 
 Data is stored as **JSONL**: one record per line, one file per reasoning type per split, e.g. `deductive.train.jsonl`, `deductive.eval.jsonl`. JSONL is required over CSV because reasoning traces are nested structures (arrays of step objects, nested verification and provenance objects) that do not fit a flat tabular format.
 
+**Sharding.** When a split grows past ~95 MiB it is split into numbered shards — `deductive.train.jsonl`, `deductive.train.001.jsonl`, `deductive.train.002.jsonl`, … — so no single file exceeds the 100 MiB host limit. Shards are logically one split (concatenate them); every shard name still contains `.train.`/`.eval.`, so tooling that globs the split (the generator's `load_corpus`, `audit_reasoning_types.py`) reads them transparently. A reader should load `{type}.{split}.jsonl` plus any `{type}.{split}.NNN.jsonl` siblings.
+
 ## Fields
 
 | Field | Type | Req | Description |

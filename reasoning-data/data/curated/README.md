@@ -2,7 +2,51 @@
 
 Items that passed every gate. Positives only: `is_correct` true and `verification.passed` true. Split into `{type}.train.jsonl` and `{type}.eval.jsonl`; eval problems are never used as generation seeds and never appear in a train file. This is the only set eligible for SFT positive targets and RLVR. See DATA.md and TRAINING.md.
 
-Current contents: most reasoning types hold 1,300 examples (1,040 train / 260 eval); analogical holds 6,226 (6,000 train / 226 eval) in this season and is designed to scale much further across seasons (see below), spanning many domains and several distinct question formats per type. The verifiable types (deductive, inductive, probabilistic, counterfactual, causal) were checked by executing their verifier; abductive and moral-ethical are template-authored with their verification method recorded, awaiting an independent Solver/judge pass.
+Current contents (train / eval / paired negatives):
+
+| type | train | eval | negatives |
+| --- | --- | --- | --- |
+| deductive | 100,000 | 120 | 25,000 |
+| inductive | 100,000 | 86 | 25,000 |
+| counterfactual | 100,000 | 92 | 25,000 |
+| metacognitive | 100,000 | 82 | -- |
+| analogical | 100,000 | 548 | -- |
+| abductive | 100,000 | 156 | -- |
+| probabilistic | 80,000 | 110 | 20,000 |
+| causal | 45,000 | 102 | 11,249 |
+| moral-ethical | 6,000 | 240 | -- |
+
+Each type is scaled to **the top of its honest limit** (measured, not padded):
+
+- **100,000** for the six types whose parametric/compound problem space is
+  effectively unbounded (deductive ~10^12 chains, inductive/counterfactual/
+  metacognitive/analogical parametric, abductive over adjective x noun components).
+- **80,000 / 45,000** for probabilistic and causal, which have *fixed*
+  combinatorial grids (measured ceilings ~97,920 and ~55,000); held just under
+  the ceiling so the season never has to enumerate the whole space.
+- **6,000** for moral-ethical, which is bank-bound (dilemmas x 15 analysis
+  modes, ceiling ~6,030) -- extended honestly rather than padded to a round
+  number, since RULES.md forbids padding with near-duplicate answers.
+
+Every split is leakage-free (0 train/eval overlap; 0 structural-signature +
+answer leakage, analogical 2 by coincidence) and spans difficulty 1-5
+(moral-ethical 2-5). Total corpus: ~838k records.
+
+Splits larger than ~95 MiB are sharded (`{type}.train.jsonl` +
+`{type}.train.NNN.jsonl`) so no file exceeds the 100 MiB host limit; the shards
+are logically one split (see SCHEMA.md). The tooling reads them transparently.
+
+**All nine types are now seed-driven with a deterministic, held-out eval** (not just analogical). Each `build_<type>` emits a fixed benchmark drawn from a *reserved* parameter/entity region (disjoint from train) plus a parametric/bank train layer, so: train and eval never share a problem; the (structural-signature, final_answer) leakage between them is zero (analogical: 1-2, coincidence); and the eval is identical every season (it saturates on append while train grows). Difficulty spans 1-5 for every type (moral-ethical spans 2-5: it has no trivial dilemmas). Every record is `generation_method: procedural` with an honest `provenance.source` -- nothing is labeled `human_expert`/`hand-authored`, because the whole corpus is produced by `tools/generate.py`. The verifiable types (deductive, inductive, probabilistic, counterfactual, causal) are checked by executing their verifier in Python and only passing items are emitted; analogical/abductive/metacognitive/moral-ethical carry their verification method (process_check / answer_match / rubric_judge) by construction and await an independent Solver/judge pass.
+
+Reproduce the corpus (deterministic, per the exact commands in the season log below):
+
+```
+# season 1 (fresh eval + train); season 2 appends new train, eval saturates
+python tools/generate.py --only deductive     --replace --per-type 3000 --seed 100 --write
+python tools/generate.py --only deductive               --per-type 3000 --seed 101 --write
+# ... analogical/inductive/probabilistic/counterfactual/causal/abductive/metacognitive similarly;
+# moral-ethical is bank-bound: one --replace season at --per-type 2000 reaches its ceiling.
+```
 
 Analogical is a **seed-driven sampling engine**, not a fixed set. `--per-type` sets train volume and each `--seed` is a fresh "season" that yields new, non-overlapping items (dedup is enforced against everything already on disk), so the corpus grows to tens of thousands by appending seasons:
 

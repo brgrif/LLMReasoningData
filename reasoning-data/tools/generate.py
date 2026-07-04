@@ -32,25 +32,32 @@ DESIGN (why it is built this way)
     compositional coverage across difficulty is what tends to produce emergent
     generalization, so breadth and correctness are prioritized over raw volume.
 
-REUSE ACROSS SEASONS
-    - Change --seed for a fresh season. The verifiable + metacognitive
-      generators are randomized/parametric, so a new seed yields genuinely new
-      items automatically (no code change).
-    - The authored types (abductive, analogical, moral-ethical) draw from the
-      BANKS near the bottom of this file. To scale those types further in a new
-      season, extend those banks (each is marked "# BANK: extend to scale").
-    - The tool is idempotent-friendly: it dedups against existing problems and
-      continues IDs, so re-running (even with the same seed) will not create
-      duplicate problems - it simply adds whatever new items it can find.
+SEED-DRIVEN, WITH A HELD-OUT EVAL FOR EVERY TYPE
+    - Every build_<type> emits a DETERMINISTIC held-out eval from a RESERVED
+      parameter/entity region (disjoint from train) plus a parametric/bank train
+      layer. So train and eval never share a problem, the (structural-signature,
+      final_answer) leakage is ~0, and the eval is identical every season (it
+      saturates on append while train grows). Difficulty spans 1-5 per type.
+    - Change --seed for a fresh season. All parametric generators (the five
+      verifiable types, metacognitive, abductive's localization layer, analogical)
+      yield genuinely new train items on a new seed. `causal` is parametric too
+      (confounder / mediation / RCT / collider / Simpson families).
+    - moral-ethical is bank-bound (MORAL_BANK x analysis modes); scale it by
+      extending MORAL_BANK. abductive mixes a CAPPED bank layer (each base once,
+      stem fixed by a stable hash) with a parametric fault-localization layer.
+    - Idempotent-friendly: dedups against existing problems and continues IDs,
+      so re-running never creates duplicate problems.
 
 HONESTY
-    Verifiable types are genuinely checked. The rubric/ranking types
-    (abductive=answer_match by ranking, analogical=process_check,
-    moral-ethical=rubric_judge) are authored so the planted ground truth
-    matches by construction; they carry their verification method but await an
-    independent Solver/judge pass (see PIPELINE.md). The generator never pads a
-    shortfall silently: if a type cannot produce the requested count of new,
-    distinct problems, it emits fewer and says so in the report.
+    Every record is generation_method=procedural (this script produces all of
+    it; nothing is labeled human_expert/multi_agent/hand-authored). The five
+    verifiable types are genuinely checked -- the verifier runs and only passing
+    items are emitted. The rubric/ranking types (abductive=answer_match,
+    analogical/metacognitive=process_check, moral-ethical=rubric_judge) match
+    their planted ground truth by construction and await an independent
+    Solver/judge pass (see PIPELINE.md). The generator never pads a shortfall:
+    if a type cannot produce the requested count of new, distinct problems it
+    emits fewer and says so (`<-- SHORT`) in the report.
 
 USAGE
     python tools/generate.py                      # dry run, 500/type, prints report
@@ -76,6 +83,47 @@ LABELS = {"valid","invalid","unverified"}
 ID_RE = re.compile(r'^(ded|ind|abd|ana|cau|cfa|prb|met|mor)-\d{6}(-neg)?$')
 REQ = ["id","reasoning_type","domain","problem","reasoning_trace","final_answer",
        "is_correct","difficulty","generation_method","verification","provenance"]
+
+# A single JSONL file is capped below GitHub's 100 MiB hard limit; larger splits
+# roll over into numbered shards ({type}.{split}.001.jsonl, .002.jsonl, ...).
+# Shard names still contain ".train."/".eval.", so load_corpus (which globs
+# **/*.jsonl) and the audit tool read them transparently.
+MAX_SHARD_BYTES = 95 * 1024 * 1024
+
+def _shard_files(data_dir, rel):
+    """Existing shard paths for a relpath base, in order (base first)."""
+    base = os.path.join(data_dir, rel)
+    stem = base[:-6]  # drop ".jsonl"
+    out = [base] if os.path.exists(base) else []
+    i = 1
+    while os.path.exists(f"{stem}.{i:03d}.jsonl"):
+        out.append(f"{stem}.{i:03d}.jsonl"); i += 1
+    return base, stem, out
+
+def write_sharded(data_dir, rel, recs, replace):
+    """Append recs to rel, rolling over to a new shard once a file would exceed
+    MAX_SHARD_BYTES. In replace mode, existing shards are removed first."""
+    base, stem, existing = _shard_files(data_dir, rel)
+    os.makedirs(os.path.dirname(base), exist_ok=True)
+    if replace:
+        for p in existing:
+            os.remove(p)
+        existing = []
+    if not existing:
+        cur, idx, curbytes = base, 0, 0
+    else:
+        cur, idx, curbytes = existing[-1], len(existing) - 1, os.path.getsize(existing[-1])
+    fh = open(cur, "a")
+    try:
+        for r in recs:
+            line = json.dumps(r, ensure_ascii=False) + "\n"
+            nb = len(line.encode("utf-8"))
+            if curbytes and curbytes + nb > MAX_SHARD_BYTES:
+                fh.close(); idx += 1
+                cur = f"{stem}.{idx:03d}.jsonl"; fh = open(cur, "w"); curbytes = 0
+            fh.write(line); curbytes += nb
+    finally:
+        fh.close()
 
 def load_canonical_domains(root):
     txt = open(os.path.join(root, "DOMAINS.md")).read()
@@ -176,60 +224,105 @@ def _domain_subject(rng):
     dom = rng.choice(list(DOMAIN_SUBJECTS))
     return dom, rng.choice(DOMAIN_SUBJECTS[dom])
 
+# Held-out predicate vocabulary: the last 16 PREDICATES are reserved for eval
+# ONLY (deductive + metacognitive), so an eval item's answer/relation predicate
+# never appears in any train item -> train/eval answer pools are disjoint by
+# construction and (structural-signature, answer) leakage is impossible.
+PRED_EVAL = PREDICATES[-16:]
+PRED_TRAIN = PREDICATES[:-16]
+
 # ==========================================================================
 # GENERATORS  (build_<type>(need, rng, exclude) -> list[instance dict])
 # Each instance: {domain, problem, steps, final, difficulty, vm, vd,
 #                 optional: confidence, and raw fields for the negative builder}
 # ==========================================================================
 
+DED_FMTS = 4
+def _entails_chain(preds, hops):
+    """Run the symbolic verifier: forward implication chain + fact entails last."""
+    vs = [f"c{i}" for i in range(len(preds))]
+    prem = [f"(not {vs[i]}) or {vs[i+1]}" for i in range(hops)]
+    return entails(vs, prem + [vs[0]], vs[-1])
+
+def _mk_deductive(dom, subj, preds, hops, fmt, distract, distractor_pred, name, split):
+    """Build one deductive item. difficulty == hops (1..5); the surface
+    distractor is flavor only and does NOT change difficulty (so level 3 is
+    reachable). Answers are the terminal predicate `preds[-1]`."""
+    first, last = preds[0], preds[-1]
+    def rule_line(i, lead):
+        subjref = f"the {subj}" if i == 0 and lead else "it"
+        return f"If {subjref} is {preds[i]}, then it is {preds[i+1]}."
+    prose = "Rules: " + " ".join(rule_line(i, i == 0) for i in range(hops))
+    dtx = (f" Separately, if it is {distractor_pred}, then a receipt prints." if distract else "")
+    if fmt == 0:
+        prob = prose + dtx + f" Fact: the {subj} is {first}. Given only these rules, is it necessarily {last}?"
+        final = f"Yes, necessarily {last}."
+    elif fmt == 1:
+        bul = "Consider these rules:\n" + "\n".join(f"- if the {subj} is {preds[i]} then it is {preds[i+1]}" for i in range(hops))
+        prob = bul + dtx + f"\nObserved: the {subj} is {first}. Does it follow that it is {last}?"
+        final = f"Yes, it follows that the {subj} is {last}."
+    elif fmt == 2:
+        prob = prose + dtx + f" The {subj} is {first}. {name} concludes it is {last}. Is that conclusion valid?"
+        final = f"Yes, {name}'s conclusion is valid: the {subj} is {last}."
+    else:
+        prob = prose + dtx + f" Fact: the {subj} is {first}. Following the rules to the end, what must be true of the {subj}?"
+        final = f"The {subj} is {last}."
+    steps = [(f"Premise {i+1}: {preds[i]} -> {preds[i+1]}.", "valid") for i in range(hops)]
+    if distract: steps.append(("The receipt rule shares no terms with the chain; a distractor, unused.", "valid"))
+    steps.append((f"Fact: the {subj} is {first}.", "valid")); cur = first
+    for i in range(hops):
+        steps.append((f"From '{cur}' and premise {i+1}, conclude '{preds[i+1]}' (modus ponens).", "valid")); cur = preds[i+1]
+    steps.append(("Check: only the premises and valid modus ponens are used.", "valid"))
+    return dict(domain=dom, problem=prob, steps=steps, final=final,
+                difficulty=min(max(1, hops), 5), vm="symbolic_solver",
+                vd=f"Encoded a length-{hops} implication chain and the fact; truth-table check confirms entailment.",
+                split=split, subj=subj, preds=preds, hops=hops)
+
+# Deterministic held-out eval: reserved predicate vocabulary (PRED_EVAL) only,
+# so eval answers are disjoint from every train answer. Stable across seasons.
+DED_EVAL_DOMS = [("logic puzzles", "glyph"), ("program behavior", "packet"),
+                 ("law and regulation", "statute"), ("chemistry", "reagent"),
+                 ("science", "reading"), ("finance and business operations", "ledger entry")]
+def _deductive_eval(seen):
+    out = []
+    def add(it):
+        if it and it["problem"] not in seen:
+            seen.add(it["problem"]); out.append(it)
+    ring = PRED_EVAL + PRED_EVAL
+    idx = 0
+    for di, (dom, subj) in enumerate(DED_EVAL_DOMS):
+        for hops in (1, 2, 3, 4, 5):
+            for fmt in range(DED_FMTS):
+                start = (idx * 3) % len(PRED_EVAL)
+                preds = ring[start:start + hops + 1]
+                if not _entails_chain(preds, hops):
+                    idx += 1; continue
+                distract = hops >= 3
+                dp = ring[(start + hops + 1) % len(PRED_EVAL)]
+                nm = NAMES[(di * 20 + hops * 4 + fmt) % len(NAMES)]
+                add(_mk_deductive(dom, subj, preds, hops, fmt, distract, dp, nm, "eval"))
+                idx += 1
+    return out
+
 def build_deductive(need, rng, exclude):
-    out, seen = [], set()
-    fmts = 4
-    attempts = 0
-    while len(out) < need and attempts < need*40 + 2000:
+    out, seen = [], set(exclude)
+    for it in _deductive_eval(seen):
+        out.append(it)                      # deterministic held-out eval (saturates)
+    made, attempts = 0, 0
+    while made < need and attempts < need*40 + 4000:
         attempts += 1
         dom, subj = _domain_subject(rng)
         hops = rng.randint(1, 5)
-        preds = rng.sample(PREDICATES, hops+1)
-        vs = [f"c{i}" for i in range(len(preds))]
-        prem = [f"(not {vs[i]}) or {vs[i+1]}" for i in range(hops)]
-        if not entails(vs, prem + [vs[0]], vs[-1]):   # always true for a forward chain; checked anyway
+        preds = rng.sample(PRED_TRAIN, hops+1)   # train draws ONLY train-pool predicates
+        if not _entails_chain(preds, hops):      # run verifier; drop failures
             continue
-        first = preds[0]; last = preds[-1]
-        def rule_line(i, lead):
-            subjref = f"the {subj}" if i == 0 and lead else "it"
-            return f"If {subjref} is {preds[i]}, then it is {preds[i+1]}."
-        prose = "Rules: " + " ".join(rule_line(i, i == 0) for i in range(hops))
-        distract = hops >= 3
-        dtx = (f" Separately, if it is {rng.choice([p for p in PREDICATES if p not in preds])}, then a receipt prints." if distract else "")
-        fmt = rng.randrange(fmts); nm = rng.choice(NAMES)
-        if fmt == 0:
-            prob = prose + dtx + f" Fact: the {subj} is {first}. Given only these rules, is it necessarily {last}?"
-            final = f"Yes, necessarily {last}."
-        elif fmt == 1:
-            bul = "Consider these rules:\n" + "\n".join(f"- if the {subj} is {preds[i]} then it is {preds[i+1]}" for i in range(hops))
-            prob = bul + dtx + f"\nObserved: the {subj} is {first}. Does it follow that it is {last}?"
-            final = f"Yes, it follows that the {subj} is {last}."
-        elif fmt == 2:
-            prob = prose + dtx + f" The {subj} is {first}. {nm} concludes it is {last}. Is that conclusion valid?"
-            final = f"Yes, {nm}'s conclusion is valid: the {subj} is {last}."
-        else:
-            prob = prose + dtx + f" Fact: the {subj} is {first}. Following the rules to the end, what must be true of the {subj}?"
-            final = f"The {subj} is {last}."
-        if prob in exclude or prob in seen:
+        distract = hops >= 2 and rng.random() < 0.4   # flavor only, difficulty == hops
+        dp = rng.choice([p for p in PRED_TRAIN if p not in preds])
+        fmt = rng.randrange(DED_FMTS); nm = rng.choice(NAMES)
+        it = _mk_deductive(dom, subj, preds, hops, fmt, distract, dp, nm, "train")
+        if it["problem"] in seen:
             continue
-        seen.add(prob)
-        steps = [(f"Premise {i+1}: {preds[i]} -> {preds[i+1]}.", "valid") for i in range(hops)]
-        if distract: steps.append(("The receipt rule shares no terms with the chain; a distractor, unused.", "valid"))
-        steps.append((f"Fact: the {subj} is {first}.", "valid")); cur = first
-        for i in range(hops):
-            steps.append((f"From '{cur}' and premise {i+1}, conclude '{preds[i+1]}' (modus ponens).", "valid")); cur = preds[i+1]
-        steps.append(("Check: only the premises and valid modus ponens are used.", "valid"))
-        out.append(dict(domain=dom, problem=prob, steps=steps, final=final,
-                        difficulty=min(max(1, hops + (1 if distract else 0)), 5),
-                        vm="symbolic_solver",
-                        vd=f"Encoded a length-{hops} implication chain and the fact; truth-table check confirms entailment.",
-                        subj=subj, preds=preds, hops=hops))
+        seen.add(it["problem"]); out.append(it); made += 1
     return out
 
 def neg_deductive(tid, it):
@@ -251,72 +344,147 @@ def neg_deductive(tid, it):
         "procedural-gen, verified", None, it["_created"],
         notes=f"paired positive: {tid}. Fallacy: affirming the consequent.")
 
+# Inductive: infer the rule behind shown pairs, then apply it. Numeric families
+# span difficulty 1..5 (shift/scale/affine -> quad -> quad2/cubic -> full
+# quadratic). Answers are rule-revealing (include the inferred coefficients), so
+# reserving a disjoint coefficient+query region for eval makes train/eval answer
+# pools disjoint and eval stable across seasons.
+IND_DIFF = {"shift": 1, "scale": 2, "affine": 2, "quad": 3, "quad2": 4, "cubic": 4, "polyfull": 5}
+def _ind_fn(name, cf):
+    a = cf.get("a", 1); b = cf.get("b", 0); c = cf.get("c", 0)
+    if name == "shift":    return (lambda x: x + b),          f"input + {b}",              f"f = lambda x: x + {b}",              f"f(x) = x + {b}"
+    if name == "scale":    return (lambda x: a * x),          f"{a}*input",                f"f = lambda x: {a}*x",                f"f(x) = {a}x"
+    if name == "affine":   return (lambda x: a * x + b),      f"{a}*input + {b}",          f"f = lambda x: {a}*x + {b}",          f"f(x) = {a}x + {b}"
+    if name == "quad":     return (lambda x: x * x + b),      f"input^2 + {b}",            f"f = lambda x: x*x + {b}",            f"f(x) = x^2 + {b}"
+    if name == "quad2":    return (lambda x: a * x * x + b),  f"{a}*input^2 + {b}",        f"f = lambda x: {a}*x*x + {b}",        f"f(x) = {a}x^2 + {b}"
+    if name == "cubic":    return (lambda x: a * x**3 + b),   f"{a}*input^3 + {b}",        f"f = lambda x: {a}*x**3 + {b}",       f"f(x) = {a}x^3 + {b}"
+    return (lambda x: a * x * x + b * x + c), f"{a}*input^2 + {b}*input + {c}", f"f = lambda x: {a}*x*x + {b}*x + {c}", f"f(x) = {a}x^2 + {b}x + {c}"
+
+IND_NUM_DOMS = ["mathematics", "science", "finance and business operations", "economics and markets",
+                "chemistry", "engineering and physical systems", "algorithms and program analysis"]
+def _mk_ind_num(name, cf, shown_xs, held_xs, q, fmt, dom, split):
+    f, dsc, code, namestr = _ind_fn(name, cf)
+    shown = [(x, f(x)) for x in shown_xs]; held = [(x, f(x)) for x in held_xs]
+    pairs = ", ".join(f"{x}->{y}" for x, y in shown)
+    if fmt == 0:
+        prob = f"From these pairs, state the rule and apply it to {q}: {pairs}."
+        final = f"Rule: {namestr}. f({q}) = {f(q)}."
+    elif fmt == 1:
+        prob = f"A function produces: {pairs}. What does it output for input {q}?"
+        final = f"f({q}) = {f(q)} (rule {namestr})."
+    else:
+        prob = f"Infer the rule behind these examples, write it as code, then evaluate at {q}: {pairs}."
+        final = f"{code}; result {f(q)}."
+    steps = [(f"Fit output = {dsc}.", "valid"),
+             ("Check shown pairs: " + ", ".join(f"f({x})={y}" for x, y in shown) + ". All hold.", "valid"),
+             (f"As code: {code}.", "valid"), (f"Apply to {q}: {f(q)}.", "valid"),
+             ("Held-out check " + ", ".join(f"{x}->{y}" for x, y in held) + ": consistent.", "valid")]
+    return dict(domain=dom, problem=prob, steps=steps, final=final, difficulty=IND_DIFF[name],
+        vm="code_execution", vd=f"Executed {namestr} on held-out {[x for x,_ in held]}; matched and f({q})={f(q)}.",
+        split=split, neg=dict(kind="num", first_in=shown[0][0], first_out=shown[0][1],
+                              snd_in=shown[1][0], snd_out=shown[1][1], query=q))
+
+def _mk_ind_seq(name, cf, split):
+    f, dsc, code, namestr = _ind_fn(name, cf)
+    seq = [f(i) for i in range(1, 5)]; nxt = f(5); nname = namestr.replace("x", "n")
+    prob = "Find the next number in the sequence and state the rule: %s, ..." % (", ".join(map(str, seq)))
+    return dict(domain="mathematics", problem=prob, difficulty=IND_DIFF[name], vm="code_execution", split=split,
+        steps=[(f"Terms follow position n via {nname}.", "valid"),
+               ("Check: " + ", ".join(f"n={i}->{f(i)}" for i in range(1, 5)) + ".", "valid"),
+               (f"Next term (n=5): {nxt}.", "valid")],
+        final=f"Next term {nxt}; rule {nname}.",
+        vd=f"Executed {namestr} at n=1..5; sequence matches and the next term is {nxt}.")
+
+STR_TX = [("reverse", lambda s: s[::-1], "reverse the string"),
+          ("upper", lambda s: s.upper(), "uppercase the string"),
+          ("double", lambda s: s + s, "repeat the string twice"),
+          ("first-cap", lambda s: s.capitalize(), "capitalize the first letter")]
+# WORDS is defined lower in the banks section; slice lazily to reserve the last
+# 16 words as eval-only query words (disjoint from train query words).
+def _words_eval():  return WORDS[-16:]
+def _words_train(): return WORDS[:-16]
+def _mk_ind_str(nm, fn, txt, demos, q, fmt, split):
+    shown = [(w, fn(w)) for w in demos]
+    pairs = ", ".join(f"{a}->{b}" for a, b in shown)
+    prob = (f"Infer the transformation and apply it to '{q}': {pairs}." if fmt == 0
+            else f"These strings follow one rule: {pairs}. What is the output for '{q}'?")
+    return dict(domain="formal grammars and symbol systems", problem=prob, difficulty=2,
+        vm="code_execution", split=split,
+        steps=[(f"Each output applies: {txt}.", "valid"), ("Check shown pairs: consistent.", "valid"),
+               (f"Apply to '{q}': '{fn(q)}'.", "valid")],
+        final=f"'{fn(q)}' (rule: {txt})",
+        vd=f"Executed the '{nm}' transform on shown inputs and the query; all match.",
+        neg=dict(kind="str", first_in=shown[0][0], first_out=shown[0][1],
+                 snd_in=shown[1][0], snd_out=shown[1][1], query=q))
+
+def _inductive_eval(seen):
+    """Deterministic held-out eval: reserved coefficients (a>=8, b>=13, c>=7),
+    reserved query points (>=16), and reserved query words; rule-revealing
+    answers -> disjoint from train answers."""
+    out = []
+    def add(it):
+        if it and it["problem"] not in seen:
+            seen.add(it["problem"]); out.append(it)
+    combos = ([("shift", {"b": b}) for b in (13, 15, 17, 19)]
+              + [("scale", {"a": a}) for a in (8, 9, 11, 12)]
+              + [("affine", {"a": a, "b": b}) for a in (8, 9, 11) for b in (13, 15, 17)]
+              + [("quad", {"b": b}) for b in (14, 16, 18, 20)]
+              + [("quad2", {"a": a, "b": b}) for a in (8, 10) for b in (13, 17)]
+              + [("cubic", {"a": a, "b": b}) for a in (8, 9) for b in (13, 20)]
+              + [("polyfull", {"a": a, "b": b, "c": c}) for (a, b, c) in
+                 ((8, 13, 7), (9, 15, 11), (11, 17, 9), (12, 19, 12))])
+    for i, (name, cf) in enumerate(combos):
+        dom = IND_NUM_DOMS[i % len(IND_NUM_DOMS)]
+        for fmt, q in ((0, [17, 19, 21, 23, 25, 26][i % 6]), (2, [16, 18, 20, 22, 24, 26][i % 6] + 1)):
+            add(_mk_ind_num(name, cf, [16, 18, 20], [22, 24], q, fmt, dom, "eval"))
+    for name, cf in [("affine", {"a": 8, "b": 13}), ("affine", {"a": 11, "b": 19}), ("scale", {"a": 9}),
+                     ("scale", {"a": 12}), ("quad", {"b": 14}), ("quad", {"b": 20}),
+                     ("quad2", {"a": 8, "b": 13}), ("shift", {"b": 15})]:
+        add(_mk_ind_seq(name, cf, "eval"))
+    ew = _words_eval()
+    for i, (nm, fn, txt) in enumerate(STR_TX):
+        for k in range(3):
+            demos = [ew[(i + k) % 16], ew[(i + k + 4) % 16], ew[(i + k + 8) % 16]]
+            q = ew[(i + k + 12) % 16]
+            add(_mk_ind_str(nm, fn, txt, demos, q, (i + k) % 2, "eval"))
+    return out
+
+def _rand_coeffs(rng, name):
+    """Train-region coefficients (disjoint from the reserved eval region)."""
+    cf = {}
+    if name in ("scale", "affine", "quad2", "cubic", "polyfull"):
+        cf["a"] = rng.randint(2, 7)
+    if name in ("shift", "affine", "quad", "quad2", "cubic"):
+        cf["b"] = rng.randint(1, 10) * rng.choice([1, -1])
+    if name == "polyfull":
+        cf["b"] = rng.randint(1, 6) * rng.choice([1, -1]); cf["c"] = rng.randint(1, 6)
+    return cf
+
 def build_inductive(need, rng, exclude):
-    out, seen = [], set()
-    def desc(kind, a, b):
-        if kind=="affine": return (lambda x:a*x+b), f"{a}*input + {b}", f"f = lambda x: {a}*x + {b}", f"f(x) = {a}x + {b}"
-        if kind=="scale":  return (lambda x:a*x),   f"{a}*input",       f"f = lambda x: {a}*x",       f"f(x) = {a}x"
-        if kind=="shift":  return (lambda x:x+b),   f"input + {b}",     f"f = lambda x: x + {b}",     f"f(x) = x + {b}"
-        if kind=="quad":   return (lambda x:x*x+b), f"input^2 + {b}",   f"f = lambda x: x*x + {b}",   f"f(x) = x^2 + {b}"
-        return (lambda x:a*x*x+b), f"{a}*input^2 + {b}", f"f = lambda x: {a}*x*x + {b}", f"f(x) = {a}x^2 + {b}"
-    attempts = 0
-    while len(out) < need and attempts < need*40 + 2000:
+    out, seen = [], set(exclude)
+    for it in _inductive_eval(seen):
+        out.append(it)
+    made, attempts = 0, 0
+    fams = (["shift"] + ["scale"] * 2 + ["affine"] * 2 + ["string"] * 3 + ["quad"] * 2
+            + ["seq"] + ["quad2"] * 2 + ["cubic"] * 2 + ["polyfull"] * 2)
+    while made < need and attempts < need * 60 + 4000:
         attempts += 1
-        if rng.random() < 0.2:  # string-rule family (formal grammars domain)
-            nm, fn, txt = rng.choice([("reverse", lambda s:s[::-1], "reverse the string"),
-                                      ("upper", lambda s:s.upper(), "uppercase the string"),
-                                      ("double", lambda s:s+s, "repeat the string twice"),
-                                      ("first-cap", lambda s:s.capitalize(), "capitalize the first letter")])
-            ws = rng.sample(WORDS, 4); shown = [(w, fn(w)) for w in ws[:3]]; q = ws[3]
-            pairs = ", ".join(f"{a}->{b}" for a, b in shown)
-            prob = rng.choice([f"Infer the transformation and apply it to '{q}': {pairs}.",
-                               f"These strings follow one rule: {pairs}. What is the output for '{q}'?"])
-            if prob in exclude or prob in seen: continue
-            seen.add(prob)
-            out.append(dict(domain="formal grammars and symbol systems", problem=prob,
-                steps=[(f"Each output applies: {txt}.", "valid"), ("Check shown pairs: consistent.", "valid"),
-                       (f"Apply to '{q}': '{fn(q)}'.", "valid")],
-                final=f"'{fn(q)}'", difficulty=2, vm="code_execution",
-                vd=f"Executed the '{nm}' transform on shown inputs and the query; all match.",
-                neg=dict(kind="str", first_in=shown[0][0], first_out=shown[0][1],
-                         snd_in=shown[1][0], snd_out=shown[1][1], query=q)))
-            continue
-        kind = rng.choice(["affine","scale","shift","quad","quad2"])
-        a = rng.randint(2, 9); b = rng.randint(1, 12) * rng.choice([1, -1])
-        f, dsc, code, name = desc(kind, a, b)
-        fmt = rng.randrange(4)
-        if fmt == 3:  # sequence-next
-            seq = [f(i) for i in range(1, 5)]; nxt = f(5)
-            prob = "Find the next number in the sequence and state the rule: %s, ..." % (", ".join(map(str, seq)))
-            if prob in exclude or prob in seen: continue
-            seen.add(prob)
-            out.append(dict(domain="mathematics", problem=prob,
-                steps=[(f"Terms follow position n via {name.replace('x','n')}.", "valid"),
-                       ("Check: " + ", ".join(f"n={i}->{f(i)}" for i in range(1, 5)) + ".", "valid"),
-                       (f"Next term (n=5): {nxt}.", "valid")],
-                final=str(nxt), difficulty=2, vm="code_execution",
-                vd=f"Executed {name} at n=1..5; sequence matches and the next term is {nxt}."))
-            continue
-        xs = rng.sample(range(0, 13), 6); shown = [(x, f(x)) for x in xs[:3]]; held = [(x, f(x)) for x in xs[3:5]]; q = xs[5]
-        pairs = ", ".join(f"{x}->{y}" for x, y in shown)
-        if fmt == 0:
-            prob = f"From these pairs, state the rule and apply it to {q}: {pairs}."; final = f"Rule: {name}. f({q}) = {f(q)}."
-            dom = rng.choice(["mathematics","science","finance and business operations","economics and markets"])
-        elif fmt == 1:
-            prob = f"A function produces: {pairs}. What does it output for input {q}?"; final = str(f(q)); dom = "program behavior"
+        fam = rng.choice(fams)
+        if fam == "string":
+            nm, fn, txt = rng.choice(STR_TX)
+            ws = rng.sample(_words_train(), 4)
+            it = _mk_ind_str(nm, fn, txt, ws[:3], ws[3], rng.randrange(2), "train")
+        elif fam == "seq":
+            name = rng.choice(["shift", "scale", "affine", "quad", "quad2"])
+            it = _mk_ind_seq(name, _rand_coeffs(rng, name), "train")
         else:
-            prob = f"Infer the rule behind these examples, write it as code, then evaluate at {q}: {pairs}."; final = f"{code}; result {f(q)}."; dom = "program behavior"
-        if prob in exclude or prob in seen: continue
-        seen.add(prob)
-        out.append(dict(domain=dom, problem=prob,
-            steps=[(f"Fit output = {dsc}.", "valid"),
-                   ("Check shown pairs: " + ", ".join(f"f({x})={y}" for x, y in shown) + ". All hold.", "valid"),
-                   (f"As code: {code}.", "valid"), (f"Apply to {q}: {f(q)}.", "valid"),
-                   ("Held-out check " + ", ".join(f"{x}->{y}" for x, y in held) + ": consistent.", "valid")],
-            final=final, difficulty=(3 if "quad" in kind else 2 if kind in ("affine","scale") else 1),
-            vm="code_execution", vd=f"Executed {name} on held-out {[x for x,_ in held]}; matched and f({q})={f(q)}.",
-            neg=dict(kind="num", first_in=shown[0][0], first_out=shown[0][1],
-                     snd_in=shown[1][0], snd_out=shown[1][1], query=q)))
+            cf = _rand_coeffs(rng, fam)
+            xs = rng.sample(range(0, 15), 6)
+            it = _mk_ind_num(fam, cf, xs[:3], xs[3:5], xs[5], rng.randrange(3),
+                             rng.choice(IND_NUM_DOMS) if fam != "shift" else "mathematics", "train")
+        if it["problem"] in seen:
+            continue
+        seen.add(it["problem"]); out.append(it); made += 1
     return out
 
 def neg_inductive(tid, it):
@@ -358,29 +526,85 @@ PRB_FRAMINGS = [
 QSTEM_P = ["Given a positive result, what is the probability that {H}?",
            "A positive result comes back. How likely is it that {H}?",
            "After a positive result, give the posterior probability that {H} (to three decimals)."]
+# Eval uses its OWN stem strings (never used in train), so the delexicalized
+# problem signature of any eval item differs from every train item -> the
+# (structural-signature, answer) leakage is zero by construction, on top of the
+# reserved held-out parameter region below.
+QSTEM_P_EVAL = ["Report the posterior probability that {H}, to three decimals, from a single positive result.",
+                "One positive result is observed; state the posterior probability that {H} (three decimals)."]
+PRB_PREVS_TRAIN = [round(x, 3) for x in [0.001,0.002,0.003,0.005,0.008,0.01,0.02,0.03,0.04,0.05,0.07,0.1,0.12,0.15,0.2,0.25,0.3]]
+PRB_RATES_TRAIN = [0.7,0.72,0.75,0.8,0.82,0.85,0.88,0.9,0.92,0.95,0.97,0.99]
+PRB_PREVS_EVAL = [0.004,0.006,0.009,0.015,0.018,0.06,0.09,0.11,0.18,0.28]     # disjoint from train
+PRB_RATES_EVAL = [0.71,0.73,0.77,0.81,0.83,0.87,0.91,0.93,0.96,0.98]          # disjoint from train
+
+def _prb_diff(prev):
+    return 1 if prev >= 0.25 else 2 if prev >= 0.1 else 3 if prev >= 0.02 else 4
+
+def _mk_prb_single(dom, ctx, H, prev, se, sp, stem, split):
+    p = bayes(prev, se, sp); den = se*prev + (1-sp)*(1-prev)
+    prob = ctx(int(round(se*100)), int(round(sp*100)), f"{prev*100:g}") + " " + stem.format(H=H)
+    return dict(domain=dom, problem=prob, difficulty=_prb_diff(prev), confidence=0.95,
+        vm="code_execution", split=split,
+        steps=[(f"Prior = {prev:g}; complement = {1-prev:g}.", "valid"),
+               (f"True-positive rate {se:g}; false-positive rate {round(1-sp,3):g}.", "valid"),
+               (f"P(positive) = {se:g}*{prev:g} + {round(1-sp,3):g}*{1-prev:g} = {den:.5f}.", "valid"),
+               (f"Posterior = {se*prev:.5f} / {den:.5f} = {p:.4f}.", "valid"),
+               ("Check: consistent with Bayes' rule.", "valid")],
+        final=f"{p:.3f}",
+        vd=f"Computed ({se:g}*{prev:g})/({se:g}*{prev:g}+{round(1-sp,3):g}*{1-prev:g}) = {p:.5f}; matches {p:.3f}.",
+        se=int(round(se*100)))
+
+PRB_DOUBLE_TAIL_TRAIN = " The test is run twice independently on the same subject and BOTH results are positive. Give the posterior probability that {H}, to three decimals."
+PRB_DOUBLE_TAIL_EVAL = " Two independent runs of the test on the same subject are BOTH positive. Report the posterior probability that {H} to three decimals."
+def _mk_prb_double(dom, ctx, H, prev, se, sp, split):
+    """Difficulty 5: two INDEPENDENT positive results -> update with se^2, (1-sp)^2."""
+    num = se*se*prev; den = num + (1-sp)*(1-sp)*(1-prev); p = num/den
+    tail = PRB_DOUBLE_TAIL_EVAL if split == "eval" else PRB_DOUBLE_TAIL_TRAIN
+    prob = ctx(int(round(se*100)), int(round(sp*100)), f"{prev*100:g}") + tail.format(H=H)
+    return dict(domain=dom, problem=prob, difficulty=5, confidence=0.9,
+        vm="code_execution", split=split,
+        steps=[(f"Prior = {prev:g}; complement = {1-prev:g}.", "valid"),
+               (f"Two independent positives multiply the likelihoods: P(++|H) = {se:g}^2, P(++|not H) = {round(1-sp,3):g}^2.", "valid"),
+               (f"P(++) = {se:g}^2*{prev:g} + {round(1-sp,3):g}^2*{1-prev:g} = {den:.6f}.", "valid"),
+               (f"Posterior = {num:.6f} / {den:.6f} = {p:.4f}.", "valid"),
+               ("Check: sequential Bayes with conditionally independent tests.", "valid")],
+        final=f"{p:.3f}",
+        vd=f"Two-test update: ({se:g}^2*{prev:g})/({se:g}^2*{prev:g}+{round(1-sp,3):g}^2*{1-prev:g}) = {p:.6f}; matches {p:.3f}.",
+        se=int(round(se*100)))
+
+def _probabilistic_eval(seen):
+    out = []
+    def add(it):
+        if it and it["problem"] not in seen:
+            seen.add(it["problem"]); out.append(it)
+    for i, (dom, ctx, H) in enumerate(PRB_FRAMINGS):
+        for j in range(9):                       # reserved params + eval-only stem
+            prev = PRB_PREVS_EVAL[(i + j) % len(PRB_PREVS_EVAL)]
+            se = PRB_RATES_EVAL[(i + 2 * j) % len(PRB_RATES_EVAL)]
+            sp = PRB_RATES_EVAL[(i + 2 * j + 3) % len(PRB_RATES_EVAL)]
+            add(_mk_prb_single(dom, ctx, H, prev, se, sp, QSTEM_P_EVAL[j % len(QSTEM_P_EVAL)], "eval"))
+        for j in range(2):
+            prev = PRB_PREVS_EVAL[(i + j) % len(PRB_PREVS_EVAL)]
+            se = PRB_RATES_EVAL[(i + 1 + j) % len(PRB_RATES_EVAL)]; sp = PRB_RATES_EVAL[(i + 4 + j) % len(PRB_RATES_EVAL)]
+            add(_mk_prb_double(dom, ctx, H, prev, se, sp, "eval"))
+    return out
 
 def build_probabilistic(need, rng, exclude):
-    out, seen = [], set()
-    prevs = [round(x, 3) for x in [0.001,0.002,0.003,0.005,0.008,0.01,0.02,0.03,0.04,0.05,0.07,0.1,0.12,0.15,0.2,0.25,0.3]]
-    rates = [0.7,0.72,0.75,0.8,0.82,0.85,0.88,0.9,0.92,0.95,0.97,0.99]
-    attempts = 0
-    while len(out) < need and attempts < need*40 + 3000:
+    out, seen = [], set(exclude)
+    for it in _probabilistic_eval(seen):
+        out.append(it)
+    made, attempts = 0, 0
+    while made < need and attempts < need*40 + 3000:
         attempts += 1
-        prev = rng.choice(prevs); se = rng.choice(rates); sp = rng.choice(rates)
-        p = bayes(prev, se, sp); den = se*prev + (1-sp)*(1-prev)
-        dom, ctx, H = rng.choice(PRB_FRAMINGS); stem = rng.choice(QSTEM_P)
-        prob = ctx(int(se*100), int(sp*100), f"{prev*100:g}") + " " + stem.format(H=H)
-        if prob in exclude or prob in seen: continue
-        seen.add(prob)
-        out.append(dict(domain=dom, problem=prob,
-            steps=[(f"Prior = {prev:g}; complement = {1-prev:g}.", "valid"),
-                   (f"True-positive rate {se:g}; false-positive rate {round(1-sp,3):g}.", "valid"),
-                   (f"P(positive) = {se:g}*{prev:g} + {round(1-sp,3):g}*{1-prev:g} = {den:.5f}.", "valid"),
-                   (f"Posterior = {se*prev:.5f} / {den:.5f} = {p:.4f}.", "valid"),
-                   ("Check: consistent with Bayes' rule.", "valid")],
-            final=f"{p:.3f}", difficulty=2 if prev>=0.1 else 3 if prev>=0.02 else 4, confidence=0.95,
-            vm="code_execution", vd=f"Computed ({se:g}*{prev:g})/({se:g}*{prev:g}+{round(1-sp,3):g}*{1-prev:g}) = {p:.5f}; matches {p:.3f}.",
-            se=int(se*100)))
+        prev = rng.choice(PRB_PREVS_TRAIN); se = rng.choice(PRB_RATES_TRAIN); sp = rng.choice(PRB_RATES_TRAIN)
+        dom, ctx, H = rng.choice(PRB_FRAMINGS)
+        if rng.random() < 0.15:                  # difficulty-5 two-test family
+            it = _mk_prb_double(dom, ctx, H, prev, se, sp, "train")
+        else:
+            it = _mk_prb_single(dom, ctx, H, prev, se, sp, rng.choice(QSTEM_P), "train")
+        if it["problem"] in seen:
+            continue
+        seen.add(it["problem"]); out.append(it); made += 1
     return out
 
 def neg_probabilistic(tid, it):
@@ -396,85 +620,178 @@ def neg_probabilistic(tid, it):
         notes=f"paired positive: {tid}. Fallacy: base-rate neglect.")
 
 CFA_STEMS = ["what would {Y} have been?", "compute the resulting {Y}.", "what would {Y} be instead?"]
+CFA_STEMS_EVAL = ["state the resulting {Y}.", "what would {Y} come to instead?"]
+def _money(x):
+    return str(int(x)) if x == int(x) else f"{x:.2f}"
+
+# One-factor linear skins: baseline = p0*q, intervene p0->p1 (q held fixed).
+# (domain, difficulty, model-label, setup format(p0,p1,q,b), Y-label)
+CFA_LINEAR = [
+    ("program behavior", 2, "volume = rate * time",
+     "A tank fills at {p0} L/min for {q} min, reaching {b} L. If the rate had been {p1} L/min for the same {q} min,", "the volume"),
+    ("engineering and physical systems", 2, "area = length * width",
+     "A plot is {q} by {p0} (area {b}). If the width were {p1} with the same length {q},", "the area"),
+    ("science", 2, "distance = speed * time",
+     "A train goes {p0} km/h for {q} h, covering {b} km. At {p1} km/h for the same {q} h,", "the distance"),
+    ("medicine-style diagnosis", 2, "dose = rate * weight",
+     "A drug is dosed at {q} mg/kg; a {p0} kg patient received {b} mg. For a {p1} kg patient at the same rate,", "the dose"),
+    ("engineering and physical systems", 2, "energy = power * hours",
+     "A heater at {p0} kW ran {q} h, using {b} kWh. At {p1} kW for the same {q} h,", "the energy"),
+    ("engineering and physical systems", 3, "voltage = current * resistance",
+     "A resistor of {p0} ohms carries {q} A, dropping {b} V. If it were {p1} ohms at the same {q} A,", "the voltage"),
+    ("program behavior", 2, "total = rate * seconds",
+     "A service handling {p0} requests/s for {q} s served {b} requests. At {p1} requests/s for the same {q} s,", "the total served"),
+    ("biology and ecology", 2, "harvest = plots * per-plot",
+     "A farm with {p0} plots yielding {q} kg each harvested {b} kg. With {p1} plots at the same {q} kg each,", "the harvest"),
+    ("economics and markets", 2, "pay = hours * rate",
+     "A worker paid {q} per hour for {p0} hours earned {b}. For {p1} hours at the same {q} per hour,", "the pay"),
+    ("everyday planning", 2, "flour = servings * per-serving",
+     "A recipe for {p0} servings uses {q} cups per serving, {b} cups in all. For {p1} servings at the same {q} cups each,", "the flour"),
+]
+def _mk_cfa_linear(skin, p0, p1, q, stem, split):
+    dom, diff, model, setup_fmt, Y = skin
+    b, c = p0 * q, p1 * q
+    prob = setup_fmt.format(p0=p0, p1=p1, q=q, b=b) + " " + stem.format(Y=Y)
+    return dict(domain=dom, problem=prob, difficulty=diff, vm="code_execution", split=split, base=b,
+        steps=[(f"Model: {model}.", "valid"), (f"Baseline: {p0}*{q} = {b}.", "valid"),
+               (f"Intervene: set the varied factor to {p1}, holding the other at {q}.", "valid"),
+               (f"Run the model: {p1}*{q} = {c}.", "valid"),
+               (f"Check: {c} differs from the factual baseline {b}, as an intervention should.", "valid")],
+        final=str(c), vd=f"{model}: intervened factor {p0}->{p1}, other={q} => {c}.")
+
+# Percentage / money skins (difficulty 3): baseline uses rate r0, intervene to r1.
+CFA_PCT = [
+    ("finance and business operations", "interest = principal * rate * years", "interest",
+     "A deposit of {P} earns simple interest at {pr0}% for {y} years, yielding {b}. At {pr1}% for the same {y} years,"),
+    ("finance and business operations", "tax = income * rate", "tax",
+     "Income of {P} taxed at {pr0}% owes {b}. At a {pr1}% rate on the same income,"),
+]
+def _mk_cfa_pct(skin, P, r0, r1, y, stem, split):
+    dom, model, Y, setup_fmt = skin
+    b = round(P * r0 * y, 2); c = round(P * r1 * y, 2)
+    prob = setup_fmt.format(P=P, pr0=round(r0*100, 4), pr1=round(r1*100, 4), y=y, b=_money(b)) + " " + stem.format(Y="the " + Y)
+    return dict(domain=dom, problem=prob, difficulty=3, vm="code_execution", split=split, base=_money(b),
+        steps=[(f"Model: {model}.", "valid"), (f"Baseline: {P}*{r0:g}*{y} = {_money(b)}.", "valid"),
+               (f"Intervene: change the rate to {r1:g}, holding principal and term.", "valid"),
+               (f"Run: {P}*{r1:g}*{y} = {_money(c)}.", "valid"),
+               (f"Check: the factual baseline {_money(b)} cannot answer the intervention.", "valid")],
+        final=_money(c), vd=f"{model}: rate {r0:g}->{r1:g} => {_money(c)}.")
+
+def _mk_cfa_simple(n0, n1, v, stem, split):     # difficulty 1
+    b, c = n0 * v, n1 * v
+    prob = (f"A shelf holds {n0} boxes of {v} items each, {b} items in all. "
+            f"If it held {n1} boxes of {v} items each instead, " + stem.format(Y="the item count"))
+    return dict(domain="everyday planning", problem=prob, difficulty=1, vm="code_execution", split=split, base=b,
+        steps=[("Model: items = boxes * per-box.", "valid"), (f"Baseline: {n0}*{v} = {b}.", "valid"),
+               (f"Intervene: boxes = {n1}, per-box unchanged at {v}.", "valid"),
+               (f"Run: {n1}*{v} = {c}.", "valid"), (f"Check: {c} != baseline {b}.", "valid")],
+        final=str(c), vd=f"items=boxes*per-box: {n1}*{v} = {c}.")
+
+def _mk_cfa_two(s0, s1, t0, t1, stem, split):   # difficulty 4: two simultaneous interventions
+    b, c = s0 * t0, s1 * t1
+    prob = (f"A pump moves water at {s0} L/min for {t0} min, moving {b} L. "
+            f"If BOTH the rate had been {s1} L/min AND it had run for {t1} min, " + stem.format(Y="the volume moved"))
+    return dict(domain="engineering and physical systems", problem=prob, difficulty=4,
+        vm="code_execution", split=split, base=b,
+        steps=[("Model: volume = rate * time.", "valid"), (f"Baseline: {s0}*{t0} = {b}.", "valid"),
+               (f"Intervene on BOTH factors: rate {s0}->{s1} and time {t0}->{t1}.", "valid"),
+               (f"Run with both changes: {s1}*{t1} = {c}.", "valid"),
+               (f"Check: applying only one change would give {s1*t0} or {s0*t1}; both together give {c}.", "valid")],
+        final=str(c), vd=f"two interventions: {s1}*{t1} = {c}; single-change values {s1*t0}/{s0*t1} rejected.")
+
+def _mk_cfa_compound(P, r0, r1, n, stem, split):    # difficulty 5: nonlinear compounding
+    b = round(P * (1 + r0) ** n, 2); c = round(P * (1 + r1) ** n, 2)
+    prob = (f"{P} is invested at {round(r0*100,4):g}% compounded annually for {n} years, growing to {_money(b)}. "
+            f"If the annual rate had been {round(r1*100,4):g}% over the same {n} years, " + stem.format(Y="the final balance"))
+    return dict(domain="finance and business operations", problem=prob, difficulty=5,
+        vm="code_execution", split=split, base=_money(b),
+        steps=[("Model: balance = principal * (1 + rate)^years (compound, not linear).", "valid"),
+               (f"Baseline: {P}*(1+{r0:g})^{n} = {_money(b)}.", "valid"),
+               (f"Intervene: rate {r0:g}->{r1:g}, term held at {n} years.", "valid"),
+               (f"Run: {P}*(1+{r1:g})^{n} = {_money(c)}.", "valid"),
+               (f"Check: compounding is nonlinear, so a linear scaling of the baseline is wrong; recomputed to {_money(c)}.", "valid")],
+        final=_money(c), vd=f"compound: {P}*(1+{r1:g})^{n} = {_money(c)}.")
+
+def _mk_cfa_chain(units, pr0, pr1, tax, stem, split):   # difficulty 5: two-stage chain
+    b = round(units * pr0 * (1 - tax), 2); c = round(units * pr1 * (1 - tax), 2)
+    prob = (f"Selling {units} units at {pr0} each and then paying {int(round(tax*100))}% tax nets {_money(b)}. "
+            f"If the price had been {pr1} each, same units and tax, " + stem.format(Y="the after-tax revenue"))
+    return dict(domain="finance and business operations", problem=prob, difficulty=5,
+        vm="code_execution", split=split, base=_money(b),
+        steps=[("Model (two stages): revenue = units*price, then after-tax = revenue*(1-tax).", "valid"),
+               (f"Baseline: {units}*{pr0}*(1-{tax:g}) = {_money(b)}.", "valid"),
+               (f"Intervene: price {pr0}->{pr1}; propagate through both stages.", "valid"),
+               (f"Run: {units}*{pr1}*(1-{tax:g}) = {_money(c)}.", "valid"),
+               (f"Check: the intervention flows through revenue into after-tax revenue; recomputed to {_money(c)}.", "valid")],
+        final=_money(c), vd=f"two-stage: {units}*{pr1}*(1-{tax:g}) = {_money(c)}.")
+
+def _counterfactual_eval(seen):
+    """Deterministic held-out eval: reserved parameter region (linear factors
+    >= 26, disjoint from train) + eval-only stems -> disjoint answers & signatures."""
+    out = []
+    def add(it):
+        if it and it["problem"] not in seen:
+            seen.add(it["problem"]); out.append(it)
+    stems = CFA_STEMS_EVAL
+    for i, sk in enumerate(CFA_LINEAR):
+        for j in range(6):
+            p0 = 31 + ((i + j) % 9); p1 = 41 + ((i + 2 * j) % 9); q = 26 + ((i + j) % 6)
+            add(_mk_cfa_linear(sk, p0, p1, q, stems[j % len(stems)], "eval"))
+    for i, sk in enumerate(CFA_PCT):
+        for j, (P, r0, r1, y) in enumerate([(7000, 0.011, 0.061, 6), (8000, 0.013, 0.071, 7),
+                                            (9000, 0.017, 0.081, 8), (7500, 0.019, 0.091, 9),
+                                            (8800, 0.014, 0.066, 6), (9600, 0.016, 0.076, 7)]):
+            add(_mk_cfa_pct(sk, P, r0, r1, y, stems[j % len(stems)], "eval"))
+    for j, (n0, n1, v) in enumerate([(31, 41, 26), (33, 44, 27), (35, 47, 28), (37, 49, 29), (39, 46, 31), (32, 48, 30)]):
+        add(_mk_cfa_simple(n0, n1, v, stems[j % len(stems)], "eval"))
+    for j, (s0, s1, t0, t1) in enumerate([(31, 41, 26, 33), (34, 45, 27, 31), (37, 48, 29, 35),
+                                          (33, 47, 28, 34), (39, 44, 30, 36), (36, 49, 31, 32)]):
+        add(_mk_cfa_two(s0, s1, t0, t1, stems[j % len(stems)], "eval"))
+    for j, (P, r0, r1, n) in enumerate([(7000, 0.031, 0.081, 9), (8500, 0.041, 0.091, 11),
+                                        (7700, 0.036, 0.086, 10), (9200, 0.046, 0.096, 12)]):
+        add(_mk_cfa_compound(P, r0, r1, n, stems[j % len(stems)], "eval"))
+    for j, (u, p0, p1, tx) in enumerate([(310, 41, 61, 0.19), (330, 44, 64, 0.23),
+                                         (350, 47, 67, 0.17), (370, 49, 69, 0.21)]):
+        add(_mk_cfa_chain(u, p0, p1, tx, stems[j % len(stems)], "eval"))
+    return out
+
 def build_counterfactual(need, rng, exclude):
-    out, seen = [], set()
-    def qc(Y): return rng.choice(CFA_STEMS).format(Y=Y)
-    def add(prob, steps, final, diff, vd, dom, base):
-        if prob in exclude or prob in seen: return
-        seen.add(prob); out.append(dict(domain=dom, problem=prob, steps=steps, final=final,
-                                        difficulty=diff, vm="code_execution", vd=vd, base=base))
-    attempts = 0
-    while len(out) < need and attempts < need*40 + 3000:
+    out, seen = [], set(exclude)
+    for it in _counterfactual_eval(seen):
+        out.append(it)
+    made, attempts = 0, 0
+    fams = (["linear"] * 10 + ["pct"] * 3 + ["simple"] * 2 + ["two"] * 3 + ["compound"] * 2 + ["chain"] * 2)
+    while made < need and attempts < need * 60 + 4000:
         attempts += 1
-        fam = rng.choice(["fill","cost","area","distance","interest","dosage","recipe","energy",
-                          "voltage","tax","throughput","yield","wage"])
-        if fam == "fill":
-            r0, r1, t = rng.randint(2,8), rng.randint(9,15), rng.randint(3,8); b, c = r0*t, r1*t
-            add(f"A tank fills at {r0} L/min for {t} min, reaching {b} L. If the rate had been {r1} L/min for the same {t} min, "+qc("the volume"),
-                [("Model: volume = rate * time.","valid"),(f"Baseline: {r0}*{t} = {b}.","valid"),(f"Intervene: rate = {r1}.","valid"),(f"Run: {r1}*{t} = {c}.","valid"),(f"Check: {c} != baseline {b}.","valid")],
-                str(c),2,f"volume=rate*time, rate={r1},time={t} => {c}.","program behavior",b)
-        elif fam == "cost":
-            u, disc, pr = rng.choice([8,10,12,15,20,25]), rng.choice([0.1,0.15,0.2,0.25,0.3,0.4]), rng.choice([12,20,25,40]); b = u*pr; c = round(u*pr*(1-disc),2); cs = str(int(c)) if c==int(c) else f"{c:.2f}"
-            add(f"An order of {u} units at {pr} each cost {b} with no discount. With a {int(disc*100)}% discount, "+qc("the cost"),
-                [("Model: cost = units*price*(1-discount).","valid"),(f"Baseline: {u}*{pr} = {b}.","valid"),(f"Intervene: discount={disc:g}. Run: {cs}.","valid"),(f"Check: baseline {b} cannot answer this.","valid")],
-                cs,3,f"cost with discount={disc:g} => {cs}.","finance and business operations",b)
-        elif fam == "area":
-            L, w0, w1 = rng.choice([6,8,10,12]), rng.choice([3,4,5]), rng.choice([7,8,9,11]); b, c = L*w0, L*w1
-            add(f"A plot is {L} by {w0} (area {b}). If the width were {w1} with the same length {L}, "+qc("the area"),
-                [("Model: area = length*width.","valid"),(f"Baseline: {L}*{w0} = {b}.","valid"),(f"Intervene: width={w1}. Run: {c}.","valid"),(f"Check: {c} != {b}.","valid")],
-                str(c),2,f"area with width={w1} => {c}.","engineering and physical systems",b)
-        elif fam == "distance":
-            s0, s1, t = rng.choice([40,50,60]), rng.choice([80,90,100,120]), rng.choice([2,3,4]); b, c = s0*t, s1*t
-            add(f"A train goes {s0} km/h for {t} h, covering {b} km. At {s1} km/h for the same {t} h, "+qc("the distance"),
-                [("Model: distance = speed*time.","valid"),(f"Baseline: {s0}*{t} = {b}.","valid"),(f"Intervene: speed={s1}. Run: {c}.","valid"),("Check: differs from baseline.","valid")],
-                str(c),2,f"distance with speed={s1} => {c}.","science",b)
-        elif fam == "interest":
-            P, rr, y = rng.choice([1000,2000,5000]), rng.choice([0.03,0.05,0.08]), rng.choice([2,3,4]); b = round(P*0.02*y,2); c = round(P*rr*y,2)
-            cs = str(int(c)) if c==int(c) else f"{c:.2f}"; bs = str(int(b)) if b==int(b) else f"{b:.2f}"
-            add(f"A deposit of {P} earns simple interest at 2% for {y} years, yielding {bs}. At {int(rr*100)}% for the same {y} years, "+qc("the interest"),
-                [("Model: interest = principal*rate*years.","valid"),(f"Baseline: {P}*0.02*{y} = {bs}.","valid"),(f"Intervene: rate={rr:g}. Run: {cs}.","valid"),("Check: baseline rate cannot answer.","valid")],
-                cs,3,f"interest with rate={rr:g} => {cs}.","finance and business operations",b)
-        elif fam == "dosage":
-            mg, w0, w1 = rng.choice([5,10,15]), rng.choice([10,20,30]), rng.choice([40,50,60]); b, c = mg*w0, mg*w1
-            add(f"A drug is dosed at {mg} mg/kg; a {w0} kg patient received {b} mg. For a {w1} kg patient at the same rate, "+qc("the dose"),
-                [("Model: dose = rate*weight.","valid"),(f"Baseline: {mg}*{w0} = {b}.","valid"),(f"Intervene: weight={w1}. Run: {c}.","valid"),("Check: differs from baseline.","valid")],
-                str(c),2,f"dose with weight={w1} => {c}.","medicine-style diagnosis",b)
-        elif fam == "recipe":
-            serv, per, fac = rng.choice([4,6,8]), rng.choice([2,3]), rng.choice([2,3]); b, c = serv*per, serv*per*fac
-            add(f"A recipe for {serv} servings uses {b} cups of flour. Scaled {fac}x richer for the same {serv} servings, "+qc("the flour"),
-                [("Model: flour = servings*per-serving.","valid"),(f"Baseline: {serv}*{per} = {b}.","valid"),(f"Intervene: per-serving *{fac}. Run: {c}.","valid"),("Check: differs from baseline.","valid")],
-                str(c),2,f"flour scaled {fac}x => {c}.","everyday planning",b)
-        elif fam == "energy":  # power * hours
-            p0, p1, h = rng.choice([2,3,5]), rng.choice([6,8,10]), rng.choice([4,6,8]); b, c = p0*h, p1*h
-            add(f"A heater at {p0} kW ran {h} h, using {b} kWh. At {p1} kW for the same {h} h, "+qc("the energy"),
-                [("Model: energy = power*hours.","valid"),(f"Baseline: {p0}*{h} = {b}.","valid"),(f"Intervene: power={p1}. Run: {c}.","valid"),("Check: differs from baseline.","valid")],
-                str(c),2,f"energy with power={p1} => {c}.","engineering and physical systems",b)
-        elif fam == "voltage":  # Ohm's law: V = I * R
-            I, r0, r1 = rng.choice([2,3,4,5]), rng.choice([3,4,6]), rng.choice([8,10,12,15]); b, c = I*r0, I*r1
-            add(f"A resistor of {r0} ohms carries {I} A, dropping {b} V. If it were {r1} ohms at the same {I} A, "+qc("the voltage"),
-                [("Model: voltage = current*resistance.","valid"),(f"Baseline: {I}*{r0} = {b}.","valid"),(f"Intervene: resistance={r1}. Run: {c}.","valid"),(f"Check: {c} != baseline {b}.","valid")],
-                str(c),3,f"voltage with resistance={r1} => {c}.","engineering and physical systems",b)
-        elif fam == "tax":  # income * rate
-            inc, t0, t1 = rng.choice([20,30,40,50,60]), rng.choice([0.1,0.15]), rng.choice([0.2,0.25,0.3]); b = round(inc*t0,2); c = round(inc*t1,2)
-            bs = str(int(b)) if b==int(b) else f"{b:.2f}"; cs = str(int(c)) if c==int(c) else f"{c:.2f}"
-            add(f"Income of {inc}k taxed at {int(t0*100)}% owes {bs}k. At a {int(t1*100)}% rate on the same {inc}k, "+qc("the tax"),
-                [("Model: tax = income*rate.","valid"),(f"Baseline: {inc}*{t0:g} = {bs}.","valid"),(f"Intervene: rate={t1:g}. Run: {cs}.","valid"),("Check: baseline rate cannot answer.","valid")],
-                cs,3,f"tax with rate={t1:g} => {cs}.","finance and business operations",b)
-        elif fam == "throughput":  # rate * seconds
-            r0, r1, s = rng.choice([20,40,50]), rng.choice([80,100,120]), rng.choice([3,5,8]); b, c = r0*s, r1*s
-            add(f"A service handling {r0} requests/s for {s} s served {b} requests. At {r1} requests/s for the same {s} s, "+qc("the total served"),
-                [("Model: total = rate*seconds.","valid"),(f"Baseline: {r0}*{s} = {b}.","valid"),(f"Intervene: rate={r1}. Run: {c}.","valid"),("Check: differs from baseline.","valid")],
-                str(c),2,f"throughput with rate={r1} => {c}.","program behavior",b)
-        elif fam == "yield":  # plots * per-plot
-            p0, per, p1 = rng.choice([6,8,10,12]), rng.choice([15,20,25]), rng.choice([16,18,20,24]); b, c = p0*per, p1*per
-            add(f"A farm with {p0} plots yielding {per} kg each harvested {b} kg. With {p1} plots at the same {per} kg each, "+qc("the harvest"),
-                [("Model: harvest = plots*per-plot.","valid"),(f"Baseline: {p0}*{per} = {b}.","valid"),(f"Intervene: plots={p1}. Run: {c}.","valid"),("Check: differs from baseline.","valid")],
-                str(c),2,f"harvest with plots={p1} => {c}.","biology and ecology",b)
-        else:  # wage: hours * rate
-            h, w0, w1 = rng.choice([20,30,40]), rng.choice([12,15,18]), rng.choice([22,25,30]); b, c = h*w0, h*w1
-            add(f"A worker paid {w0}/h for {h} h earned {b}. At {w1}/h for the same {h} h, "+qc("the pay"),
-                [("Model: pay = hours*rate.","valid"),(f"Baseline: {h}*{w0} = {b}.","valid"),(f"Intervene: rate={w1}. Run: {c}.","valid"),("Check: differs from baseline.","valid")],
-                str(c),2,f"pay with rate={w1} => {c}.","economics and markets",b)
+        fam = rng.choice(fams); stem = rng.choice(CFA_STEMS)
+        if fam == "linear":
+            sk = rng.choice(CFA_LINEAR)
+            p0 = rng.randint(2, 25); p1 = rng.randint(2, 25); q = rng.randint(2, 25)
+            if p1 == p0: p1 = p0 + 1
+            it = _mk_cfa_linear(sk, p0, p1, q, stem, "train")
+        elif fam == "pct":
+            sk = rng.choice(CFA_PCT); P = rng.choice([1000, 1500, 2000, 3000, 4000, 5000, 6000])
+            r0 = rng.choice([0.02, 0.03, 0.04, 0.05]); r1 = rng.choice([0.06, 0.07, 0.08, 0.1, 0.12])
+            it = _mk_cfa_pct(sk, P, r0, r1, rng.randint(2, 9), stem, "train")
+        elif fam == "simple":
+            n0 = rng.randint(2, 12); n1 = rng.randint(2, 15); v = rng.randint(2, 12)
+            if n1 == n0: n1 = n0 + 1
+            it = _mk_cfa_simple(n0, n1, v, stem, "train")
+        elif fam == "two":
+            s0 = rng.randint(2, 20); s1 = rng.randint(2, 20); t0 = rng.randint(2, 20); t1 = rng.randint(2, 20)
+            if s1 == s0: s1 = s0 + 1
+            if t1 == t0: t1 = t0 + 1
+            it = _mk_cfa_two(s0, s1, t0, t1, stem, "train")
+        elif fam == "compound":
+            P = rng.choice([1000, 2000, 3000, 5000]); r0 = rng.choice([0.02, 0.03, 0.04]); r1 = rng.choice([0.05, 0.06, 0.08])
+            it = _mk_cfa_compound(P, r0, r1, rng.randint(3, 12), stem, "train")
+        else:
+            u = rng.randint(20, 200); p0 = rng.randint(5, 40); p1 = rng.randint(5, 40)
+            if p1 == p0: p1 = p0 + 1
+            it = _mk_cfa_chain(u, p0, p1, rng.choice([0.1, 0.15, 0.2, 0.25]), stem, "train")
+        if it["problem"] in seen:
+            continue
+        seen.add(it["problem"]); out.append(it); made += 1
     return out
 
 def neg_counterfactual(tid, it):
@@ -488,49 +805,198 @@ def neg_counterfactual(tid, it):
         "procedural-gen, verified", None, it["_created"],
         notes=f"paired positive: {tid}. Fallacy: answering from the factual baseline.")
 
-CAU_STEMS = ["Is the claim supported, and what would settle it?",
-             "Design an experiment that would determine whether the first truly causes the second.",
-             "{name} insists the first causes the second. Critique this reasoning.",
-             "Identify any confounder and say whether the causal claim holds."]
-def build_causal(need, rng, exclude):
-    out, seen = [], set()
-    # confounder items: activity pairs sharing a seasonal/systemic driver
-    for drv, (acts, dom) in list(CAUSAL_DRIVERS.items()):
+# Causal: parametric families whose ANSWER is determined by the planted graph
+# and the numbers (partial correlation, effect decomposition, trial size), so
+# each item does real causal reasoning and scales freely with the seed. The
+# verification ceiling for causal is answer-match against a known causal graph
+# (DOMAINS.md), which is what these encode.
+CAU_Q_TRAIN = ["Does the first quantity cause the second on this evidence, and what would settle it?",
+               "Is the causal claim warranted here? Explain.",
+               "Assess whether this establishes causation, and how you would confirm it."]
+CAU_Q_EVAL = ["Does this evidence establish that the first causes the second?",
+              "State whether the causal claim holds and what would settle it."]
+# X, Y independent causes of a collider C (conditioning on C induces spurious correlation).
+CAU_COLLIDER = [
+    ("athletic talent", "academic ability", "admission to a selective scholarship program", "social situations"),
+    ("acting skill", "physical attractiveness", "being cast as a working actor", "social situations"),
+    ("code quality", "marketing spend", "a startup getting acquired", "finance and business operations"),
+    ("engine power", "fuel efficiency", "a car passing a strict certification", "engineering and physical systems"),
+    ("kindness", "competence", "getting hired after interviews", "social situations"),
+    ("symptom severity", "test positivity", "being admitted to the study ward", "medicine-style diagnosis"),
+    ("manuscript novelty", "writing polish", "a paper clearing peer review", "narrative and discourse"),
+    ("soil richness", "rainfall", "a plot being chosen for the trial", "biology and ecology"),
+]
+# Treatment X lowers outcome Y within every subgroup, but the pooled data reverse (Simpson).
+CAU_SIMPSON = [
+    ("a new treatment", "the recovery rate", "case severity", "medicine-style diagnosis"),
+    ("an ad campaign", "the conversion rate", "customer segment", "economics and markets"),
+    ("a study method", "the pass rate", "prior preparation", "science"),
+    ("a code-review policy", "the defect rate", "module complexity", "program behavior"),
+    ("a fertilizer", "the yield", "soil type", "biology and ecology"),
+    ("a staffing change", "the resolution rate", "ticket difficulty", "incident and root-cause analysis"),
+]
+def _cau_triples(drivers):
+    out = []
+    for z, (acts, dom) in drivers.items():
         for x, y in combinations(acts, 2):
-            for stem in CAU_STEMS:
-                nm = rng.choice(NAMES)
-                prob = f"{cap(x)} and {y} rise and fall together; both also track {drv}. " + stem.format(name=nm)
-                if prob in exclude or prob in seen: continue
-                seen.add(prob)
-                out.append(dict(domain=dom, problem=prob,
-                    steps=[(f"Observed: {x} and {y} correlate.","valid"),
-                           (f"{cap(drv)} raises both, a common cause (confounder).","valid"),
-                           (f"That common cause already accounts for the correlation, so the co-movement on its own does not establish a direct {x}->{y} link.","valid"),
-                           (f"Discriminating test: hold {drv} fixed and vary {x}; watch {y}.","valid"),
-                           (f"Check: at fixed {drv}, if {y} still tracks {x} there is a direct effect; if not, the claim is unsupported.","valid")],
-                    final=f"Not supported by this evidence: {drv} is a confounder, so the correlation alone cannot establish that {x} causes {y}. Hold {drv} fixed and vary {x} to test for any direct effect on {y}.",
-                    difficulty=3, vm="answer_match",
-                    vd=f"Modeled common cause: {drv} drives both {x} and {y}, which explains their co-movement; a direct {x}->{y} effect is not established without intervening on {x} at fixed {drv}.", is_conf=True))
-    # mediator + direct items
-    for cause, eff, med, dom in CAUSAL_MED:
-        prob = f"{cap(cause)} is associated with {eff}. The model has no direct arrow; {cause} produces {med}, which produces {eff}. Does {cause} cause {eff}, and how?"
-        if prob not in exclude and prob not in seen:
-            seen.add(prob); out.append(dict(domain=dom, problem=prob,
-                steps=[(f"Edges: {cause} -> {med} -> {eff}.","valid"),(f"No direct edge; {med} is a mediator.","valid"),
-                       (f"{cap(cause)} causes {eff} indirectly via {med}.","valid"),(f"Test: block {med}; {eff} should drop.","valid"),
-                       ("Check: the effect flows through the mediator.","valid")],
-                final=f"Yes, indirectly: the effect is mediated by {med}. Blocking the mediator would eliminate it.",
-                difficulty=3, vm="answer_match", vd=f"Graph {cause}->{med}->{eff}; mediated cause.", is_conf=False))
-    for cause, eff, dom in CAUSAL_DIRECT:
-        prob = f"The model has a direct edge {cause} -> {eff} and no common cause. A controlled test varies {cause} alone and {eff} follows. Is the causal claim supported?"
-        if prob not in exclude and prob not in seen:
-            seen.add(prob); out.append(dict(domain=dom, problem=prob,
-                steps=[(f"Edge: {cause} -> {eff}, no confounder.","valid"),("A controlled intervention varies the cause alone.","valid"),
-                       (f"{cap(eff)} responds, matching the edge.","valid"),("Check: no confounder + responsive intervention => supported.","valid")],
-                final="Yes, supported; the controlled intervention isolates the cause and the effect responds.",
-                difficulty=2, vm="answer_match", vd=f"Direct edge {cause}->{eff}, no confounder.", is_conf=False))
-    rng.shuffle(out)
-    return out[:need] if len(out) > need else out
+            out.append((x, y, z, dom))
+    return out
+
+def _mk_cau_confound(x, y, z, dom, r, pr, q, split):
+    confounded = pr < 0.15
+    if confounded:
+        final = (f"Not supported: controlling for {z} collapses the association (r = {r:g} -> partial r = {pr:g}, "
+                 f"near zero), so {z} is a confounder and the evidence does not show that {x} causes {y}.")
+        last = "Near zero: the raw correlation was almost entirely the common cause, so no direct effect is established."
+        verdict = "not supported (confounded)"
+    else:
+        final = (f"Supported as a direct effect: the association largely survives controlling for {z} "
+                 f"(r = {r:g} -> partial r = {pr:g}), so beyond the shared driver there is a direct {x} -> {y} link.")
+        last = "Still substantial: part of the association remains after removing the common cause, indicating a direct effect."
+        verdict = "supported (direct effect persists)"
+    prob = (f"Across many observations, {x} and {y} are correlated (r = {r:g}); both also track {z}. "
+            f"After statistically controlling for {z}, the partial correlation between them is {pr:g}. " + q)
+    return dict(domain=dom, problem=prob, difficulty=(3 if (pr < 0.08 or pr >= 0.45) else 4),
+        vm="answer_match", split=split, is_conf=confounded,
+        steps=[(f"Observed: {x} and {y} correlate at r = {r:g}; both move with {z}.", "valid"),
+               (f"{cap(z)} is a candidate common cause (confounder) of both.", "valid"),
+               (f"Control for {z}: the partial correlation between {x} and {y} is {pr:g}.", "valid"),
+               (last, "valid"),
+               (f"Check: the verdict follows from whether the association survives conditioning on {z} -- {verdict}.", "valid")],
+        final=final, vd=f"Common cause {z}; partial r={pr:g} => {verdict}.")
+
+def _mk_cau_mediation(cause, eff, med, dom, te, de, q, split):
+    ind = round(te - de, 2); full = de < 0.08
+    if full:
+        final = (f"Yes, but entirely indirectly: the total effect ({te:g}) of {cause} on {eff} runs through {med} "
+                 f"(direct effect ~{de:g}); blocking {med} would remove it.")
+        last = f"Direct part is ~0, so the effect is fully mediated by {med}."
+    else:
+        final = (f"Yes, partly directly and partly through {med}: total effect {te:g} = direct {de:g} + indirect {ind:g} via {med}.")
+        last = f"Both paths carry effect: a direct {cause} -> {eff} arrow plus the path through {med}."
+    prob = (f"A study finds {cause} is associated with {eff} (total effect {te:g}). Holding {med} fixed, the "
+            f"direct effect of {cause} on {eff} is {de:g}; {cause} also changes {med}, which changes {eff}. " + q)
+    return dict(domain=dom, problem=prob, difficulty=(3 if full else 4), vm="answer_match", split=split, is_conf=False,
+        steps=[(f"Graph: {cause} -> {med} -> {eff}, possibly plus a direct {cause} -> {eff}.", "valid"),
+               (f"Total effect measured: {te:g}.", "valid"),
+               (f"Direct effect (holding {med} fixed): {de:g}; indirect via {med} = {te:g} - {de:g} = {ind:g}.", "valid"),
+               (last, "valid"), ("Check: total = direct + indirect decomposition of the causal effect.", "valid")],
+        final=final, vd=f"Effect decomposition: total {te:g} = direct {de:g} + indirect {ind:g} via {med}.")
+
+def _mk_cau_rct(cause, eff, dom, delta, n, q, split):
+    prob = (f"A randomized controlled trial with {n} subjects varies {cause} alone (random assignment) and finds {eff} "
+            f"shifts by {delta:g} in the treated group. " + q)
+    return dict(domain=dom, problem=prob, difficulty=2, vm="answer_match", split=split, is_conf=False,
+        steps=[(f"Design: randomized assignment of {cause}, so treated and control groups differ only in {cause}.", "valid"),
+               ("Randomization breaks any back-door path, ruling out confounders in expectation.", "valid"),
+               (f"{cap(eff)} responds by {delta:g} under the manipulation.", "valid"),
+               ("Check: a responsive randomized intervention isolates the cause.", "valid")],
+        final=f"Supported: the randomized trial (n = {n}) isolates {cause}, and {eff} responds by {delta:g}, so the causal claim holds.",
+        vd=f"RCT n={n}, effect {delta:g}; randomization rules out confounders.")
+
+def _mk_cau_toggle(cause, eff, dom, k, q, split):
+    prob = (f"Over {k} separate trials, {cause} is switched on and off while nothing else is changed, and {eff} follows "
+            f"every single time. " + q)
+    return dict(domain=dom, problem=prob, difficulty=1, vm="answer_match", split=split, is_conf=False,
+        steps=[(f"Each trial is a controlled manipulation of {cause} with all else held fixed.", "valid"),
+               (f"{cap(eff)} tracks the manipulation across all {k} trials with no exceptions.", "valid"),
+               ("Repeated responsive manipulation with nothing else varying establishes the cause.", "valid"),
+               ("Check: this is intervention, not mere correlation.", "valid")],
+        final=f"Yes: manipulating {cause} toggles {eff} every time across {k} controlled trials, so {cause} causes {eff}.",
+        vd=f"{k} controlled on/off manipulations; effect every time.")
+
+def _mk_cau_collider(x, y, c, dom, rc, q, split):
+    prob = (f"In the general population {x} and {y} are independent. But among cases selected by {c}, they show a "
+            f"correlation of r = {rc:g}. Someone concludes {x} affects {y}. " + q)
+    return dict(domain=dom, problem=prob, difficulty=5, vm="answer_match", split=split, is_conf=False,
+        steps=[(f"{cap(c)} is a common EFFECT of both {x} and {y} (a collider), not a cause.", "valid"),
+               (f"Conditioning on {c} (selecting on it) opens a spurious path between {x} and {y}.", "valid"),
+               (f"So the r = {rc:g} appears only inside the {c}-selected sample; in the population they are independent.", "valid"),
+               ("Check: the association is collider (selection) bias, not a causal link.", "valid")],
+        final=(f"Not causal: {x} and {y} are independent in the population; the r = {rc:g} is collider bias from "
+               f"selecting on {c} (a common effect), so it does not show {x} affects {y}."),
+        vd=f"Collider {c}; conditioning induces spurious r={rc:g}; no causal link.")
+
+def _mk_cau_simpson(tr, out_, sub, dom, lo, hi, q, split):
+    prob = (f"In every subgroup of {sub}, {tr} is associated with a LOWER {out_} (by about {lo:g} points). Yet in the "
+            f"pooled data, {tr} shows a HIGHER {out_} (by about {hi:g} points), because {sub} is distributed unevenly "
+            f"across the groups. " + q)
+    return dict(domain=dom, problem=prob, difficulty=5, vm="answer_match", split=split, is_conf=False,
+        steps=[(f"Within every {sub} subgroup, {tr} lowers {out_} by ~{lo:g}: a consistent within-group effect.", "valid"),
+               (f"The pooled +{hi:g} reversal comes from unequal {sub} mix between treated and untreated (a confounder).", "valid"),
+               (f"{cap(sub)} confounds the pooled comparison; the subgroup (adjusted) effect is the causal one.", "valid"),
+               ("Check: Simpson's paradox -- trust the stratified estimate, not the aggregate.", "valid")],
+        final=(f"The causal effect is the within-subgroup one: {tr} lowers {out_}. The pooled increase is Simpson's "
+               f"paradox from an uneven {sub} mix, not a real positive effect."),
+        vd=f"Simpson's paradox: within-{sub} effect negative, pooled positive from confounding by {sub}.")
+
+CAU_R_TRAIN = [0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9]
+CAU_PR_TRAIN = [0.02, 0.05, 0.08, 0.1, 0.12, 0.35, 0.45, 0.55]
+CAU_R_EVAL = [0.58, 0.63, 0.72, 0.83, 0.88]
+CAU_PR_EVAL = [0.03, 0.06, 0.11, 0.4, 0.5]
+def _causal_eval(seen):
+    """Deterministic held-out eval: reserved driver/entity banks + reserved
+    numeric params + eval-only question stems -> disjoint answers & signatures."""
+    out = []
+    def add(it):
+        if it and it["problem"] not in seen:
+            seen.add(it["problem"]); out.append(it)
+    ev_triples = _cau_triples({k: v for k, v in list(CAUSAL_DRIVERS.items())[-3:]})
+    for i, (x, y, z, dom) in enumerate(ev_triples[:40]):
+        for j in range(2):
+            r = CAU_R_EVAL[(i + j) % len(CAU_R_EVAL)]; pr = CAU_PR_EVAL[(i + 2 * j) % len(CAU_PR_EVAL)]
+            add(_mk_cau_confound(x, y, z, dom, r, pr, CAU_Q_EVAL[(i + j) % 2], "eval"))
+    for i, (cause, eff, med, dom) in enumerate(CAUSAL_MED[-6:]):
+        for te, de in [(0.5, 0.0), (0.6, 0.3), (0.8, 0.0)]:
+            add(_mk_cau_mediation(cause, eff, med, dom, te, de, CAU_Q_EVAL[i % 2], "eval"))
+    for i, (cause, eff, dom) in enumerate(CAUSAL_DIRECT[-6:]):
+        add(_mk_cau_rct(cause, eff, dom, [0.35, 0.5, 0.4, 0.6, 0.45, 0.55][i % 6], [220, 340, 480, 610, 290, 520][i % 6], CAU_Q_EVAL[i % 2], "eval"))
+        add(_mk_cau_toggle(cause, eff, dom, [12, 15, 18, 21, 14, 24][i % 6], CAU_Q_EVAL[(i + 1) % 2], "eval"))
+    for i, (x, y, c, dom) in enumerate(CAU_COLLIDER[-3:]):
+        for rc in [0.42, 0.55]:
+            add(_mk_cau_collider(x, y, c, dom, rc, CAU_Q_EVAL[i % 2], "eval"))
+    for i, (tr, o, sub, dom) in enumerate(CAU_SIMPSON[-3:]):
+        for lo, hi in [(6, 4), (8, 5)]:
+            add(_mk_cau_simpson(tr, o, sub, dom, lo, hi, CAU_Q_EVAL[i % 2], "eval"))
+    return out
+
+def build_causal(need, rng, exclude):
+    out, seen = [], set(exclude)
+    for it in _causal_eval(seen):
+        out.append(it)
+    train_drivers = {k: v for k, v in list(CAUSAL_DRIVERS.items())[:-3]}
+    conf_triples = _cau_triples(train_drivers)
+    med_train = CAUSAL_MED[:-6]; direct_train = CAUSAL_DIRECT[:-6]
+    coll_train = CAU_COLLIDER[:-3]; simp_train = CAU_SIMPSON[:-3]
+    made, attempts = 0, 0
+    fams = (["confound"] * 6 + ["mediation"] * 3 + ["rct"] * 2 + ["toggle"] * 2 + ["collider"] * 2 + ["simpson"] * 2)
+    while made < need and attempts < need * 60 + 5000:
+        attempts += 1
+        fam = rng.choice(fams); q = rng.choice(CAU_Q_TRAIN)
+        if fam == "confound":
+            x, y, z, dom = rng.choice(conf_triples)
+            it = _mk_cau_confound(x, y, z, dom, rng.choice(CAU_R_TRAIN), rng.choice(CAU_PR_TRAIN), q, "train")
+        elif fam == "mediation":
+            cause, eff, med, dom = rng.choice(med_train)
+            te = rng.choice([0.4, 0.5, 0.6, 0.7, 0.8, 0.9]); de = rng.choice([0.0, 0.05, 0.2, 0.3, 0.4])
+            if de >= te: de = 0.0
+            it = _mk_cau_mediation(cause, eff, med, dom, te, de, q, "train")
+        elif fam == "rct":
+            cause, eff, dom = rng.choice(direct_train)
+            it = _mk_cau_rct(cause, eff, dom, rng.choice([0.2, 0.3, 0.4, 0.5, 0.6, 0.7]), rng.choice(range(120, 900, 20)), q, "train")
+        elif fam == "toggle":
+            cause, eff, dom = rng.choice(direct_train)
+            it = _mk_cau_toggle(cause, eff, dom, rng.randint(6, 40), q, "train")
+        elif fam == "collider":
+            x, y, c, dom = rng.choice(coll_train)
+            it = _mk_cau_collider(x, y, c, dom, rng.choice([0.3, 0.35, 0.45, 0.5, 0.6]), q, "train")
+        else:
+            tr, o, sub, dom = rng.choice(simp_train)
+            it = _mk_cau_simpson(tr, o, sub, dom, rng.randint(4, 12), rng.randint(3, 9), q, "train")
+        if it["problem"] in seen:
+            continue
+        seen.add(it["problem"]); out.append(it); made += 1
+    return out
 
 def neg_causal(tid, it):
     if not it.get("is_conf"): return None
@@ -547,58 +1013,151 @@ Q_MET = ["Audit this reasoning and correct it: '{T}'",
          "Find the first error in this argument, or say it is valid: '{T}'",
          "Is this argument valid? If not, identify the flaw: '{T}'",
          "A student wrote: '{T}'. Grade it and fix any mistake."]
+# Metacognitive: audit a short argument, find the planted error (or certify it
+# clean). Family builders take explicit params + a stem index so they are
+# deterministic; train draws params by rng from the TRAIN region, eval
+# enumerates a fixed set from a disjoint EVAL region -> answers are disjoint and
+# eval is stable across seasons. Every "clean" family's answer includes its own
+# numbers, so the correct-case answer is not a constant string (no leakage).
+def _met_arith(a, b, qi, split):    # difficulty 1: certify a correct addition
+    c = a + b
+    prob = Q_MET[qi].format(T=f"{a} + {b} = {c}.")
+    return dict(domain="mathematics", problem=prob, difficulty=1, vm="process_check", split=split,
+        steps=[(f"Add: {a} + {b} = {c}.", "valid"), (f"The stated sum is {c}; it matches.", "valid"),
+               ("No error is present.", "valid")],
+        final=f"No errors. {a} + {b} = {c} is correct.", vd="Certified a correct one-step addition.")
+
+def _met_half(N, qi, split):        # difficulty 2: arithmetic slip
+    half = N // 2; slip = half - 2; qq = N // 4
+    prob = Q_MET[qi].format(T=f"Half of {N} is {half}, and half of {half} is {slip}, so a quarter of {N} is {slip}.")
+    return dict(domain="mathematics", problem=prob, difficulty=2, vm="process_check", split=split,
+        steps=[(f"Half of {N} is {half}. Correct.", "valid"),
+               (f"Half of {half} is {half//2}, not {slip}: an arithmetic slip.", "valid"),
+               (f"Correction: a quarter of {N} is {qq}.", "valid")],
+        final=f"Error: half of {half} is {half//2}, not {slip}. A quarter of {N} is {qq}.",
+        vd="Planted arithmetic slip; recomputed.")
+
+def _met_affirm(dom, subj, preds, qi, split):   # difficulty scales with chain length
+    L = len(preds) - 1
+    T = "Rules: " + " ".join(f"If the {subj} is {preds[i]}, then it is {preds[i+1]}." for i in range(L)) + \
+        f" Observed: the {subj} is {preds[-1]}. Therefore it is {preds[0]}."
+    prob = Q_MET[qi].format(T=T)
+    return dict(domain=dom, problem=prob, difficulty=min(1 + L, 5), vm="process_check", split=split,
+        steps=[(f"The forward chain '{preds[0]}' -> ... -> '{preds[-1]}' ({L} steps) is fine.", "valid"),
+               (f"But it then infers '{preds[0]}' from '{preds[-1]}': affirming the consequent.", "valid"),
+               (f"'{preds[-1]}' can hold for other reasons, so it does not entail '{preds[0]}'.", "valid"),
+               (f"Correction: '{preds[0]}' is not justified by the observation.", "valid")],
+        final=f"Error: affirming the consequent. '{preds[-1]}' does not entail '{preds[0]}'.",
+        vd=f"Planted error: affirming the consequent across a length-{L} chain.")
+
+def _met_root(k, qi, split):        # difficulty 3: skipped negative root
+    sq = k * k
+    prob = Q_MET[qi].format(T=f"x^2 = {sq}, so x = {k}.")
+    return dict(domain="mathematics", problem=prob, difficulty=3, vm="process_check", split=split,
+        steps=[(f"x = {k} satisfies x^2 = {sq}.", "valid"), ("It skips the negative root.", "valid"),
+               (f"x = -{k} also works.", "valid")],
+        final=f"Error: a skipped case. x = {k} or x = -{k}.", vd="Planted skipped negative root.")
+
+def _met_clean_div(d, mult, qi, split):     # difficulty 3: valid, no error
+    n = d * mult
+    prob = Q_MET[qi].format(T=f"If a number is divisible by {d} then it is even, since {d} is even. {n} is divisible by {d}, so {n} is even.")
+    return dict(domain="mathematics", problem=prob, difficulty=3, vm="process_check", split=split,
+        steps=[(f"Divisible by {d} implies even, since {d} is even. Valid.", "valid"),
+               (f"{n} is divisible by {d}.", "valid"), (f"So {n} is even. Valid.", "valid"),
+               ("No error is present.", "valid")],
+        final=f"No errors. The reasoning is valid: {n} is even.", vd="Certified a clean divisibility argument.")
+
+def _met_clean_odd(nn, qi, split):  # difficulty 3: valid, no error (answer varies with nn)
+    s = nn * nn; odds = ", ".join(str(2 * i + 1) for i in range(nn))
+    prob = Q_MET[qi].format(T=f"The sum of the first n odd numbers is n^2. The first {nn} odd numbers are {odds}, summing to {s} = {nn}^2.")
+    return dict(domain="mathematics", problem=prob, difficulty=3, vm="process_check", split=split,
+        steps=[(f"{odds.replace(', ', ' + ')} = {s}.", "valid"), (f"{s} = {nn}^2.", "valid"),
+               (f"Matches the identity for n = {nn}.", "valid"), ("No error is present.", "valid")],
+        final=f"No errors. The first {nn} odd numbers sum to {s} = {nn}^2, as claimed.",
+        vd="Certified a clean sum-of-odds identity instance.")
+
+def _met_offby(n, qi, split):       # difficulty 4: off-by in a triangular sum
+    correct = n * (n + 1) // 2; wrong = correct + n
+    prob = Q_MET[qi].format(T=f"The sum 1 + 2 + ... + {n} equals n(n+1)/2. For n = {n} that gives {wrong}.")
+    return dict(domain="mathematics", problem=prob, difficulty=4, vm="process_check", split=split,
+        steps=[("The formula n(n+1)/2 for the sum 1..n is correct.", "valid"),
+               (f"But n(n+1)/2 at n = {n} is {n}*{n+1}/2 = {correct}, not {wrong}.", "valid"),
+               (f"The arithmetic was off by {n}.", "valid"), (f"Correction: the sum is {correct}.", "valid")],
+        final=f"Error: n(n+1)/2 at n = {n} is {correct}, not {wrong}.",
+        vd=f"Planted evaluation error; recomputed {n}(n+1)/2 = {correct}.")
+
+def _met_false_identity(n, qi, split):      # difficulty 5: a plausible but WRONG general formula
+    correct = n * (n + 1) // 2; claimed = (n * n) // 2
+    prob = Q_MET[qi].format(T=f"Claim: the sum of the first n positive integers equals n^2/2. Check at n = {n}: n^2/2 = {claimed}.")
+    return dict(domain="mathematics", problem=prob, difficulty=5, vm="process_check", split=split,
+        steps=[("The proposed identity is sum(1..n) = n^2/2.", "valid"),
+               (f"The correct closed form is n(n+1)/2, which at n = {n} is {correct}.", "valid"),
+               (f"The claim gives n^2/2 = {claimed} at n = {n}, differing from {correct}: the formula is wrong (it drops the +n/2 term).", "valid"),
+               ("The error is a wrong general identity, not a slip; it fails for every n > 0.", "valid")],
+        final=f"Error: the formula is wrong. Sum of 1..{n} is {correct} (n(n+1)/2), not n^2/2 = {claimed}.",
+        vd=f"Refuted a false general identity; correct sum n(n+1)/2 = {correct} vs claimed {claimed}.")
+
+def _metacognitive_eval(seen):
+    """Deterministic held-out eval over reserved parameter regions."""
+    out = []
+    def add(it):
+        if it and it["problem"] not in seen:
+            seen.add(it["problem"]); out.append(it)
+    for i, (a, b) in enumerate([(41, 58), (47, 66), (53, 74), (61, 89), (72, 95)]):
+        add(_met_arith(a, b, i % len(Q_MET), "eval"))
+    for i, N in enumerate(range(604, 900, 28)):        # reserved half range
+        add(_met_half(N, i % len(Q_MET), "eval"))
+    ev_doms = [("logic puzzles", "glyph"), ("program behavior", "packet"), ("chemistry", "reagent")]
+    ring = PRED_EVAL + PRED_EVAL
+    idx = 0
+    for L in (1, 2, 3, 4):
+        for j in range(3):
+            dom, subj = ev_doms[j % len(ev_doms)]
+            preds = ring[idx:idx + L + 1]; idx += 1
+            add(_met_affirm(dom, subj, preds, (L + j) % len(Q_MET), "eval"))
+    for i, k in enumerate(range(45, 61)):              # reserved root range
+        add(_met_root(k, i % len(Q_MET), "eval"))
+    for i, d in enumerate(range(58, 80, 2)):           # reserved clean_div: product > train max (504)
+        add(_met_clean_div(d, 10 + (i % 4), i % len(Q_MET), "eval"))
+    for i, nn in enumerate(range(10, 15)):             # reserved clean_odd range
+        add(_met_clean_odd(nn, i % len(Q_MET), "eval"))
+    for i, n in enumerate(range(31, 42)):              # reserved offby range
+        add(_met_offby(n, i % len(Q_MET), "eval"))
+    for i, n in enumerate(range(31, 42)):              # reserved false-identity range
+        add(_met_false_identity(n, i % len(Q_MET), "eval"))
+    return out
+
 def build_metacognitive(need, rng, exclude):
-    out, seen = [], set()
-    def q(T): return rng.choice(Q_MET).format(T=T)
-    attempts = 0
-    while len(out) < need and attempts < need*40 + 3000:
+    out, seen = [], set(exclude)
+    for it in _metacognitive_eval(seen):
+        out.append(it)
+    made, attempts = 0, 0
+    # weighted family mix spreads difficulty 1..5 across the volume
+    fams = (["arith"] * 2 + ["half"] * 2 + ["affirm1"] + ["affirm2"] + ["affirm3"] + ["affirm4"]
+            + ["root"] * 2 + ["clean_div"] * 2 + ["clean_odd"] * 2 + ["offby"] * 2 + ["false_id"] * 2)
+    while made < need and attempts < need * 60 + 4000:
         attempts += 1
-        kind = rng.choice(["affirm","half","root","clean_div","clean_odd"])
-        if kind == "affirm":
-            dom, subj = _domain_subject(rng); L = rng.randint(1, 3); preds = rng.sample(PREDICATES, L+1)
-            T = "Rules: " + " ".join(f"If the {subj} is {preds[i]}, then it is {preds[i+1]}." for i in range(L)) + f" Observed: the {subj} is {preds[-1]}. Therefore it is {preds[0]}."
-            prob = q(T)
-            if prob in exclude or prob in seen: continue
-            seen.add(prob)
-            out.append(dict(domain=dom, problem=prob,
-                steps=[(f"The chain '{preds[0]}' -> ... -> '{preds[-1]}' is fine.","valid"),
-                       (f"It infers '{preds[0]}' from '{preds[-1]}': affirming the consequent.","valid"),
-                       (f"'{preds[-1]}' can hold for other reasons.","valid"),(f"Correction: '{preds[0]}' is not justified.","valid")],
-                final=f"Error: affirming the consequent. '{preds[-1]}' does not entail '{preds[0]}'.",
-                difficulty=2 if L==1 else 3, vm="process_check", vd="Planted error: affirming the consequent."))
-        elif kind == "half":
-            N = rng.choice([n for n in range(44, 900, 4)]); half = N//2; slip = half-2; qq = N//4
-            prob = q(f"Half of {N} is {half}, and half of {half} is {slip}, so a quarter of {N} is {slip}.")
-            if prob in exclude or prob in seen: continue
-            seen.add(prob)
-            out.append(dict(domain="mathematics", problem=prob,
-                steps=[(f"Half of {N} is {half}. Correct.","valid"),(f"Half of {half} is {half//2}, not {slip}: an arithmetic slip.","valid"),(f"Correction: a quarter of {N} is {qq}.","valid")],
-                final=f"Error: half of {half} is {half//2}, not {slip}. A quarter of {N} is {qq}.",
-                difficulty=2, vm="process_check", vd="Planted arithmetic slip."))
-        elif kind == "root":
-            k = rng.randint(6, 60); sq = k*k
-            prob = q(f"x^2 = {sq}, so x = {k}.")
-            if prob in exclude or prob in seen: continue
-            seen.add(prob)
-            out.append(dict(domain="mathematics", problem=prob,
-                steps=[(f"x = {k} satisfies x^2 = {sq}.","valid"),("It skips the negative root.","valid"),(f"x = -{k} also works.","valid")],
-                final=f"Error: a skipped case. x = {k} or x = -{k}.", difficulty=3, vm="process_check", vd="Planted skipped negative root."))
-        elif kind == "clean_div":
-            d = rng.choice([n for n in range(4, 80, 2)]); n = d*rng.randint(3, 9)
-            prob = q(f"If a number is divisible by {d} then it is even, since {d} is even. {n} is divisible by {d}, so {n} is even.")
-            if prob in exclude or prob in seen: continue
-            seen.add(prob)
-            out.append(dict(domain="mathematics", problem=prob,
-                steps=[(f"Divisible by {d} implies even, since {d} is even. Valid.","valid"),(f"{n} is divisible by {d}.","valid"),(f"So {n} is even. Valid.","valid"),("No error is present.","valid")],
-                final=f"No errors. The reasoning is valid: {n} is even.", difficulty=2, vm="process_check", vd="Planted CLEAN trace; certified."))
-        else:  # clean_odd
-            nn = rng.randint(3, 12); s = nn*nn; odds = ", ".join(str(2*i+1) for i in range(nn))
-            prob = q(f"The sum of the first n odd numbers is n^2. The first {nn} odd numbers are {odds}, summing to {s} = {nn}^2.")
-            if prob in exclude or prob in seen: continue
-            seen.add(prob)
-            out.append(dict(domain="mathematics", problem=prob,
-                steps=[(f"{odds.replace(', ',' + ')} = {s}.","valid"),(f"{s} = {nn}^2.","valid"),(f"Matches the identity for n = {nn}.","valid"),("No error is present.","valid")],
-                final="No errors. The reasoning is valid.", difficulty=2, vm="process_check", vd="Planted CLEAN trace; certified."))
+        fam = rng.choice(fams); qi = rng.randrange(len(Q_MET))
+        if fam == "arith":
+            it = _met_arith(rng.randint(2, 39), rng.randint(2, 39), qi, "train")   # reserved-disjoint range
+        elif fam == "half":
+            it = _met_half(rng.choice(range(44, 600, 4)), qi, "train")
+        elif fam.startswith("affirm"):
+            L = int(fam[-1]); dom, subj = _domain_subject(rng); preds = rng.sample(PRED_TRAIN, L + 1)
+            it = _met_affirm(dom, subj, preds, qi, "train")
+        elif fam == "root":
+            it = _met_root(rng.randint(6, 44), qi, "train")
+        elif fam == "clean_div":
+            it = _met_clean_div(rng.choice(range(4, 58, 2)), rng.randint(3, 9), qi, "train")
+        elif fam == "clean_odd":
+            it = _met_clean_odd(rng.randint(3, 9), qi, "train")
+        elif fam == "offby":
+            it = _met_offby(rng.randint(5, 30), qi, "train")
+        else:
+            it = _met_false_identity(rng.randint(5, 30), qi, "train")
+        if it["problem"] in seen:
+            continue
+        seen.add(it["problem"]); out.append(it); made += 1
     return out
 
 # --- authored types (bank x format); grow BANKS for larger seasons ----------
@@ -608,23 +1167,129 @@ Q_ABD = ["What most plausibly explains this?", "Rank the possible explanations a
          "Give the most probable cause and briefly say why each alternative is less likely.",
          "As the technician on call, what is your leading diagnosis and reasoning?",
          "Infer the best explanation and note your confidence in it."]
-def build_abductive(need, rng, exclude):
-    out, seen = [], set()
+Q_ABD_EVAL = ["Which single cause best explains this, and why are the alternatives weaker?"]
+def _abd_bank_bases(entries):
     bases = []
-    for dom, subject, sigs in ABD_BANK:
+    for dom, subject, sigs in entries:
         for sig, cause, alts in sigs:
-            steps = [(f"Observation: {subject}, {sig}.", "valid")]
-            for alt, why in alts: steps.append((f"Alternative '{alt}' is unlikely: {why}.", "valid"))
-            steps.append((f"Best explanation: {cause}.", "valid")); steps.append(("Confidence moderate: not every competing factor was directly measured.", "valid"))
-            bases.append((dom, subject, sig, cause, steps))
-    for stem in Q_ABD:
-        for dom, subject, sig, cause, steps in bases:
-            prob = f"{cap(subject)}: {sig}. {stem}"
-            if prob in exclude or prob in seen: continue
-            seen.add(prob)
-            out.append(dict(domain=dom, problem=prob, steps=steps, final=cap(cause)+".", difficulty=3, confidence=0.65,
-                            vm="answer_match", vd=f"Planted cause: {cause}. Top explanation ranks above the alternatives."))
-            if len(out) >= need: return out
+            bases.append((dom, subject, sig, cause, alts))
+    return bases
+
+def _mk_abd_rank(dom, subject, sig, cause, alts, stem, split):
+    """Ranking-by-signature item; EACH base emitted ONCE (phrasing fixed by a
+    stable hash of its identity) so an answer is never re-skinned across stems."""
+    steps = [(f"Observation: {subject}, {sig}.", "valid")]
+    for alt, why in alts:
+        steps.append((f"Alternative '{alt}' is unlikely: {why}.", "valid"))
+    steps.append((f"Best explanation: {cause}.", "valid"))
+    steps.append(("Confidence moderate: not every competing factor was directly measured.", "valid"))
+    diff = 2 if len(alts) <= 1 else 3 if len(alts) == 2 else 4
+    return dict(domain=dom, problem=f"{cap(subject)}: {sig}. {stem}", steps=steps,
+        final=cap(cause) + ".", difficulty=diff, confidence=0.65, vm="answer_match", split=split,
+        vd=f"Planted cause: {cause}; the top explanation ranks above the listed alternatives by the distinguishing evidence.")
+
+def _mk_abd_localize(dom, stages, jfail, distract, split):
+    """Parametric fault-localization: from an OK/error/starved pattern in a
+    series, localize the fault. The answer (the faulty component) genuinely
+    varies with the stage set and fault position."""
+    n = len(stages); faulty = stages[jfail]
+    upstream = stages[:jfail]; downstream = stages[jfail + 1:]
+    us = ", ".join(f"the {s}" for s in upstream) or "no earlier stage"
+    ds = ", ".join(f"the {s}" for s in downstream) or "no later stage"
+    prob = (f"A process runs in series through {n} stages: " + ", ".join(f"the {s}" for s in stages) + ". "
+            f"Health checks show {us} reporting OK, the {faulty} reporting an error, and {ds} receiving nothing (starved). "
+            + (f"Separately, a status label on the {downstream[-1]} is outdated. " if distract and downstream else "")
+            + "Which single stage is the fault, and how are the others explained away?")
+    steps = [
+        (f"This is a {n}-stage series process, so a fault at one stage starves everything downstream while upstream stages stay healthy.", "valid"),
+        (f"Upstream ({us}) reports OK, so the fault is not before the {faulty}.", "valid"),
+        (f"Downstream ({ds}) receives nothing -- consistent with being starved by an upstream block, not with its own fault.", "valid"),
+        (f"The {faulty} is the earliest stage whose own signal is anomalous, so it best explains the whole pattern.", "valid"),
+    ]
+    if distract and downstream:
+        steps.append((f"The outdated label on the {downstream[-1]} is cosmetic and carries no failure signal; rule it out.", "valid"))
+    steps.append(("Best explanation: the earliest stage that itself reports an anomaly.", "valid"))
+    diff = min(max(1, n - 1) + (1 if distract else 0), 5)
+    return dict(domain=dom, problem=prob, steps=steps, final=f"The fault is at the {faulty}.",
+        difficulty=diff, confidence=0.8, vm="answer_match", split=split,
+        vd=f"Localized to the {faulty} (stage {jfail+1}): upstream OK, downstream starved; earliest anomalous stage.")
+
+# Component names for fault-localization: adjective x noun -> realistic, distinct
+# stage names. Eval reserves the last 3 adjectives, so every eval component name
+# (hence every eval fault-answer) is disjoint from train.
+# Adjective x noun compound component names. The LAST 3 adjectives are reserved
+# for eval, so every eval fault-answer is disjoint from train. Pools are sized so
+# distinct answers (train_adj x noun + bank) stay well above ~1000, keeping
+# answer-reuse reasonable even at 100k train.
+ABD_ADJ = ["intake", "primary", "secondary", "upstream", "relief", "bypass", "main", "auxiliary",
+           "inlet", "outlet", "control", "feed", "return", "pilot", "booster",
+           "supply", "drain", "vent", "charge", "discharge", "suction", "delivery", "transfer",
+           "recirculation", "makeup", "standby", "emergency", "backup", "lead", "lag",
+           "trim", "isolation", "purge"]
+ABD_NOUN = ["valve", "pump", "filter", "sensor", "regulator", "manifold", "coupling", "relay",
+            "gate", "module", "junction", "buffer", "compressor", "exchanger", "actuator", "condenser",
+            "turbine", "blower", "strainer", "damper", "injector", "nozzle", "seal", "bearing",
+            "gearbox", "heater", "cooler", "tank", "reservoir", "controller", "transducer", "impeller"]
+ABD_LOC_DOMS = ["engineering and physical systems", "mechanical / systems troubleshooting",
+                "program behavior", "incident and root-cause analysis", "chemistry",
+                "biology and ecology", "science", "finance and business operations",
+                "algorithms and program analysis", "economics and markets",
+                "law and regulation", "everyday planning"]
+def _abd_parts(adjs, rng, n):
+    return [f"{rng.choice(adjs)} {rng.choice(ABD_NOUN)}" for _ in range(n * 3)]
+
+def _abductive_eval(seen):
+    """Held-out eval: reserved bank entries (last 6) + reserved component adjectives
+    + an eval-only stem -> disjoint problems and answers."""
+    out = []
+    def add(it):
+        if it and it["problem"] not in seen:
+            seen.add(it["problem"]); out.append(it)
+    for (dom, subject, sig, cause, alts) in _abd_bank_bases(ABD_BANK[-6:]):
+        add(_mk_abd_rank(dom, subject, sig, cause, alts, Q_ABD_EVAL[0], "eval"))
+    ev_adj = ABD_ADJ[-3:]
+    idx = 0
+    for a in ev_adj:
+        for nz in ABD_NOUN:
+            for n in (3, 4):
+                stages = [f"{a} {ABD_NOUN[(idx + k) % len(ABD_NOUN)]}" for k in range(n)]
+                if len({*stages}) < n:
+                    idx += 1; continue
+                jfail = idx % n
+                add(_mk_abd_localize(ABD_LOC_DOMS[idx % len(ABD_LOC_DOMS)], stages, jfail, jfail < n - 1, "eval"))
+                idx += 1
+    return out
+
+def build_abductive(need, rng, exclude):
+    out, seen = [], set(exclude)
+    for it in _abductive_eval(seen):
+        out.append(it)
+    train_bases = _abd_bank_bases(ABD_BANK[:-6])
+    # bank layer (capped: each base ONCE, stem fixed by a stable hash of identity)
+    for (dom, subject, sig, cause, alts) in train_bases:
+        stem = Q_ABD[_shash("A|" + subject + "|" + sig) % len(Q_ABD)]
+        it = _mk_abd_rank(dom, subject, sig, cause, alts, stem, "train")
+        if it["problem"] not in seen:
+            seen.add(it["problem"]); out.append(it)
+    made = sum(1 for it in out if it.get("split") == "train")
+    # volume layer: parametric fault-localization over compound component names
+    # (train adjectives only -> answers disjoint from the reserved eval set).
+    train_adj = ABD_ADJ[:-3]
+    attempts = 0
+    while made < need and attempts < need * 60 + 5000:
+        attempts += 1
+        n = rng.randint(2, 6)
+        parts = list(dict.fromkeys(_abd_parts(train_adj, rng, n)))   # distinct, order-preserving
+        if len(parts) < n:
+            continue
+        stages = parts[:n]
+        jfail = rng.randrange(n)
+        distract = rng.random() < 0.4 and jfail < n - 1
+        dom = ABD_LOC_DOMS[attempts % len(ABD_LOC_DOMS)]
+        it = _mk_abd_localize(dom, stages, jfail, distract, "train")
+        if it["problem"] in seen:
+            continue
+        seen.add(it["problem"]); out.append(it); made += 1
     return out
 
 # --------------------------------------------------------------------------
@@ -903,7 +1568,7 @@ Q_ANA_TRAIN = [
     "Study the pairs {demo}. They all follow the relation '{rel}'. Now do {t0} : ?",
     "Pattern ({rel}): {demo}. Extend it: {t0} -> ?",
     "Here {aleft} is paired with its {right}: {demo}. What should pair with {t0}?",
-    "Each of these maps a {left} to its {right}: {demo}. Fill in {t0} -> ?",
+    "Each of these maps {aleft} to its {right}: {demo}. Fill in {t0} -> ?",
     "Following the single relation '{rel}' shown by {demo}, complete {t0} -> ?",
     "The examples {demo} share one rule ({rel}). Apply that rule to {t0}.",
     "Analogy: as in {demo} ({rel}), give the match for {t0}.",
@@ -2048,31 +2713,149 @@ def build_analogical(need, rng, exclude):
             emit(it)
     return out
 
-Q_MOR = ["Lay out the strongest case for each side.",
-         "What competing ethical principles are at stake, and how do they conflict?",
-         "Analyze this dilemma from at least two ethical frameworks.",
-         "How should this be reasoned about?",
-         "Argue the case for one side, then give the strongest rebuttal.",
-         "Identify the stakeholders and what each is owed.",
-         "Where would a consequentialist and a rights-based view diverge here?",
-         "What principle would you have to accept to justify each choice?"]
+# Moral-ethical: each MODE asks a genuinely DIFFERENT question about the dilemma
+# and produces a genuinely different analysis (not one trace re-skinned across
+# stems), so each (scenario, mode) is a distinct reasoning task. Verification is
+# rubric_judge and NO mode forces a verdict (the type rewards reasoning quality,
+# not a fixed conclusion).
+def _mor_both(fa, fb):
+    return ([(f"Frame the tension: {fa} versus {fb}.", "valid"),
+             (f"Strongest case for the first side: it rests on {fa}, and on that principle the choice is justified.", "valid"),
+             (f"Strongest case for the second side: it rests on {fb}, which a pure appeal to the first ignores.", "valid"),
+             ("Each case is internally coherent; they differ on which principle is prior.", "valid")],
+            f"Both sides are defensible: one case rests on {fa}, the other on {fb}. Which is stronger turns on the priority given to each principle, not on a forced verdict.")
+def _mor_conflict(fa, fb):
+    return ([(f"Principle at stake on one side: {fa}.", "valid"),
+             (f"Principle at stake on the other: {fb}.", "valid"),
+             (f"They conflict because honoring {fa} here requires setting aside {fb}, and vice versa.", "valid"),
+             ("The conflict is genuine: no option satisfies both principles fully.", "valid")],
+            f"The competing principles are {fa} and {fb}; they conflict because each can be honored here only at the other's expense.")
+def _mor_frameworks(fa, fb):
+    return ([(f"Consequentialist reading: weighing outcomes tends to support {fa}.", "valid"),
+             (f"Deontological reading: some duties resist an outcome count, supporting {fb}.", "valid"),
+             (f"Virtue/care reading: asks which choice expresses good character and preserves relationships, which can cut either way.", "valid"),
+             ("The frameworks disagree, so the verdict depends on which framework is authoritative.", "valid")],
+            f"Under consequentialism the case leans to {fa}; under a duty- or rights-based view it leans to {fb}; a virtue reading is not decisive. The frameworks diverge.")
+def _mor_reason(fa, fb):
+    return ([(f"Name the tension: {fa} versus {fb}.", "valid"),
+             ("Weigh the outcomes and the duties on each side without assuming a winner.", "valid"),
+             ("Consistency check: the chosen principle must be acceptable applied generally and to oneself.", "valid"),
+             ("Acknowledge the residual: any choice leaves a real moral cost, which the reasoning must name.", "valid")],
+            f"Reason it by making the trade-off between {fa} and {fb} explicit and adopting a principle one could accept applied generally; whichever is chosen leaves a residual cost to acknowledge.")
+def _mor_rebut(fa, fb):
+    return ([(f"Argue one side: the choice grounded in {fa} is justified because the stakes it protects are weighty.", "valid"),
+             (f"Strongest rebuttal: {fb} shows that this reasoning proves too much and licenses conclusions we would reject elsewhere.", "valid"),
+             ("The rebuttal does not simply reassert the other side; it attacks the first argument's principle.", "valid"),
+             ("A reply would have to limit the principle so it does not overreach.", "valid")],
+            f"The case for the first side rests on {fa}; the strongest rebuttal is that {fb} exposes it as overreaching, so the argument needs a principled limit to survive.")
+def _mor_stakeholders(fa, fb):
+    return ([("Identify the stakeholders: the decision-maker, those directly affected, and third parties.", "valid"),
+             (f"The party favored by {fa} is owed the protection that principle names.", "valid"),
+             (f"The party favored by {fb} is owed what that principle names, which the first can override.", "valid"),
+             ("Naming what each is owed shows the decision distributes burdens, not just benefits.", "valid")],
+            f"Each stakeholder is owed something: those served by {fa} and those served by {fb}. The dilemma is how to distribute the unavoidable burden between them.")
+def _mor_diverge(fa, fb):
+    return ([(f"A consequentialist counts total welfare and tends to endorse {fa}.", "valid"),
+             (f"A rights-based view asks what is owed regardless of the tally, and tends to endorse {fb}.", "valid"),
+             ("They diverge exactly where maximizing the aggregate would violate an individual claim.", "valid"),
+             ("Neither view is obviously wrong, so the divergence is the crux.", "valid")],
+            f"They diverge where maximizing aggregate welfare ({fa}) would override an individual claim ({fb}); that trade-off is the crux.")
+def _mor_principle(fa, fb):
+    return ([(f"To justify the first choice you must accept a principle like: {fa} may take priority even at the cost named by {fb}.", "valid"),
+             (f"To justify the second you must accept: {fb} constrains action even when {fa} would gain by overriding it.", "valid"),
+             ("Test each principle by universalizing it: would you accept it applied to yourself and in other cases?", "valid"),
+             ("Each choice commits you to a general principle, so the decision is really a choice between principles.", "valid")],
+            f"Each option commits you to a general principle -- either that {fa} may override, or that {fb} constrains -- and the choice is defensible only if you accept the principle it requires, universally.")
+def _mor_veil(fa, fb):
+    return ([("Step behind a veil of ignorance: decide without knowing which party you would turn out to be.", "valid"),
+             (f"If you might be the party protected by {fa}, you want that principle honored.", "valid"),
+             (f"If you might be the party protected by {fb}, you want that one honored instead.", "valid"),
+             ("The defensible arrangement is the one you could accept from either position, imposing no unacceptable worst case on the party you might become.", "valid")],
+            f"Behind the veil of ignorance the choice must be acceptable whether you turn out to be the party served by {fa} or by {fb}; it fails if it loads an intolerable worst case onto either.")
+def _mor_reversibility(fa, fb):
+    return ([("Apply the reversibility test: would the actor accept this same treatment if the roles were switched?", "valid"),
+             (f"From the side of {fa}, the act may look justified to the one who benefits.", "valid"),
+             (f"From the side of {fb}, ask whether that same actor would consent to it done to them.", "valid"),
+             ("A choice the actor would refuse in the other's shoes is suspect; one they would accept either way is better grounded.", "valid")],
+            f"By the reversibility test the choice is defensible only if the actor would accept it with the roles reversed; {fa} and {fb} each pass or fail depending on whose position you occupy.")
+def _mor_proportionality(fa, fb):
+    return ([("Weigh means against ends: what harm does each option impose, and is it the least necessary?", "valid"),
+             (f"Pursuing {fa} inflicts some cost on the side of {fb}; ask whether a less harmful route to the same end exists.", "valid"),
+             (f"Pursuing {fb} likewise constrains {fa}; the same proportionality question applies in reverse.", "valid"),
+             ("The proportional choice secures its aim with the smallest unavoidable harm, not merely the largest benefit.", "valid")],
+            f"Proportionality asks whether the harm each option imposes is the least necessary to secure its aim; the defensible choice minimizes unavoidable harm between {fa} and {fb}, not just maximizes the goal.")
+def _mor_care(fa, fb):
+    return ([("Read the case through care ethics: center the relationships, dependencies, and who is most vulnerable.", "valid"),
+             (f"{cap(fa)} answers to one set of obligations of care and attention.", "valid"),
+             (f"{cap(fb)} answers to another, often to whoever depends most on the decision-maker.", "valid"),
+             ("Care ethics asks what preserves trust and responds to the vulnerable, rather than applying a rule from a distance.", "valid")],
+            f"A care-ethics reading centers the relationships and dependencies at stake, asking what preserves trust and protects the most vulnerable; that can favor {fa} or {fb} depending on who depends on whom.")
+def _mor_residue(fa, fb):
+    return ([("Notice that even the better choice leaves a wronged party -- a moral remainder.", "valid"),
+             (f"If {fa} prevails, the interest behind {fb} is set back and its holders are owed something.", "valid"),
+             (f"If {fb} prevails, the interest behind {fa} is set back in turn.", "valid"),
+             ("A complete response names the residue and what is owed afterward: acknowledgment, and repair where possible.", "valid")],
+            f"Whichever way it goes a moral residue remains: the side not chosen ({fa} or {fb}) is owed acknowledgment and, where possible, repair -- a complete answer names that debt rather than pretending the choice is cost-free.")
+def _mor_precedent(fa, fb):
+    return ([("Treat the decision as setting a precedent: a rule for every relevantly similar case.", "valid"),
+             (f"Choosing {fa} here licenses giving it priority in the next like case too.", "valid"),
+             (f"Choosing {fb} here licenses the opposite general pattern.", "valid"),
+             ("Ask whether the pattern each choice establishes is one you could accept applied across all such cases, not just this one.", "valid")],
+            f"As a precedent, favoring {fa} or {fb} sets a rule for every like case; the choice is defensible only if the general pattern it licenses -- not just this instance -- is one we could live with.")
+def _mor_virtue(fa, fb):
+    return ([("Ask what a person of practical wisdom would do, and what each option expresses about character.", "valid"),
+             (f"Honoring {fa} can express virtues such as justice, courage, or fidelity.", "valid"),
+             (f"Honoring {fb} can express compassion, honesty, or loyalty instead.", "valid"),
+             ("Virtue ethics locates the answer in the disposition the choice reveals, not in a formula, so it asks which virtue the situation makes central.", "valid")],
+            f"A virtue reading asks what a person of practical wisdom would do and what each option expresses: {fa} and {fb} each answer to real virtues, so the choice reveals which one the situation makes central.")
+MORAL_MODES = [
+    ("Lay out the strongest case for each side.", 3, _mor_both),
+    ("What competing ethical principles are at stake, and how do they conflict?", 3, _mor_conflict),
+    ("Analyze this dilemma from at least two ethical frameworks.", 4, _mor_frameworks),
+    ("How should this be reasoned about?", 3, _mor_reason),
+    ("Argue the case for one side, then give the strongest rebuttal.", 4, _mor_rebut),
+    ("Identify the stakeholders and what each is owed.", 2, _mor_stakeholders),
+    ("Where would a consequentialist and a rights-based view diverge here?", 4, _mor_diverge),
+    ("What principle would you have to accept to justify each choice?", 5, _mor_principle),
+    ("Decide it from behind a veil of ignorance, not knowing which party you would be.", 4, _mor_veil),
+    ("Apply the reversibility test: would the actor accept this with the roles switched?", 3, _mor_reversibility),
+    ("Assess the proportionality of means to ends and whether a less harmful option exists.", 4, _mor_proportionality),
+    ("Analyze it through care ethics, centering relationships and the most vulnerable.", 3, _mor_care),
+    ("What moral residue remains, and what is owed to the side not chosen?", 4, _mor_residue),
+    ("What precedent does each choice set for future like cases?", 5, _mor_precedent),
+    ("What would a person of good character do, and what does each choice express?", 3, _mor_virtue),
+]
+def _mk_moral(scenario, fa, fb, mode, split):
+    stem, diff, fn = mode
+    steps, final = fn(fa, fb)
+    return dict(domain="ethics", problem=scenario + " " + stem, steps=steps, final=final,
+        difficulty=diff, vm="rubric_judge", split=split,
+        vd="Rubric scored perspective coverage, reasoning quality, and internal consistency; no predetermined verdict rewarded.")
+
+def _moral_eval(seen):
+    """Held-out eval: reserved scenarios (last 16) across all modes."""
+    out = []
+    def add(it):
+        if it and it["problem"] not in seen:
+            seen.add(it["problem"]); out.append(it)
+    for scenario, fa, fb in MORAL_BANK[-16:]:
+        for mode in MORAL_MODES:
+            add(_mk_moral(scenario, fa, fb, mode, "eval"))
+    return out
+
 def build_moral(need, rng, exclude):
-    out, seen = [], set()
-    for stem in Q_MOR:
-        for prob0, fa, fb in MORAL_BANK:
-            prob = prob0 + " " + stem
-            if prob in exclude or prob in seen: continue
-            seen.add(prob)
-            out.append(dict(domain="ethics", problem=prob,
-                steps=[(f"Name the tension: {fa} versus {fb}.", "valid"),
-                       (f"Consequentialist reading: weighing outcomes supports {fa}.", "valid"),
-                       (f"Duty/fairness reading: some obligations resist a pure outcome count, supporting {fb}.", "valid"),
-                       ("Consistency check: the chosen principle must be acceptable applied generally and to oneself.", "valid"),
-                       ("Acknowledge the residual: any choice leaves a real moral cost, which the reasoning names.", "valid")],
-                final=f"Both positions are defensible: one case rests on {fa}, the other on {fb}. The decision turns on which principle is adopted and applied consistently, not on a single forced verdict.",
-                difficulty=3, vm="rubric_judge",
-                vd="Rubric scored perspective coverage (two frameworks), reasoning quality, and internal consistency; no predetermined conclusion rewarded."))
-            if len(out) >= need: return out
+    out, seen = [], set(exclude)
+    for it in _moral_eval(seen):
+        out.append(it)
+    made = 0
+    for scenario, fa, fb in MORAL_BANK[:-16]:      # train scenarios (reserved held out)
+        for mode in MORAL_MODES:
+            if made >= need:
+                return out
+            it = _mk_moral(scenario, fa, fb, mode, "train")
+            if it["problem"] in seen:
+                continue
+            seen.add(it["problem"]); out.append(it); made += 1
     return out
 
 BUILDERS = {"deductive": build_deductive, "inductive": build_inductive, "probabilistic": build_probabilistic,
@@ -2080,14 +2863,17 @@ BUILDERS = {"deductive": build_deductive, "inductive": build_inductive, "probabi
             "abductive": build_abductive, "analogical": build_analogical, "moral-ethical": build_moral}
 NEG_BUILDERS = {"deductive": neg_deductive, "inductive": neg_inductive, "probabilistic": neg_probabilistic,
                 "counterfactual": neg_counterfactual, "causal": neg_causal}
-# analogical is procedurally generated from ANA_REL + parametric trap kernels
-# (the trap arithmetic is recomputed here), so it is labeled procedural -- not
-# human_expert/hand-authored, which would misrepresent how it was produced.
-GEN_METHOD = {t: ("multi_agent" if t == "metacognitive" else
-                  "human_expert" if t in {"abductive","moral-ethical"} else "procedural") for t in RT}
-SOURCE = {t: ("hand-authored" if t in {"abductive","moral-ethical"}
-              else "procedural-gen" if t == "analogical"      # by-construction + computed checks, awaits Solver pass
-              else "procedural-gen, verified") for t in RT}
+# HONESTY (SCHEMA/RULES + the BAR): every type here is produced by THIS SCRIPT,
+# so generation_method is "procedural" for all of them -- labeling any of them
+# "human_expert"/"multi_agent" would misrepresent how the data is really made.
+# The verifiable types are additionally checked by running their verifier in
+# Python (only passing items are emitted); the rest carry their verification
+# method by construction and await an independent Solver/judge pass, which the
+# provenance.source string states plainly (never claims hand-authoring).
+GEN_METHOD = {t: "procedural" for t in RT}
+SOURCE = {t: ("procedural-gen, verified" if t in VERIFIABLE
+              else "procedural-gen from authored banks" if t in {"abductive", "moral-ethical"}
+              else "procedural-gen") for t in RT}
 
 # --------------------------------------------------------------------------
 # Word / relation / scenario BANKS  (# BANK: extend to scale a type)
@@ -2294,7 +3080,7 @@ MORAL_BANK = [
  ("A doctor can allocate a scarce drug by lottery.","fairness through equal chance","directing it to those who benefit most"),
  ("A city can ban downtown cars to cut pollution, hurting small shops.","cleaner air for all","affected livelihoods"),
  ("A friend can tell a hard truth that may end the friendship.","honesty and long-term good","the relationship and kindness"),
- ("A company can keep a profitable product a few misuse harmfully.","serving the many","protecting the vulnerable few"),
+ ("A company can keep a profitable product a few misuse harmfully.","the good of the many","protecting the vulnerable few"),
  ("A soldier can share intel that saves allies but exposes an informant.","protecting allied lives","the duty to the informant"),
  ("A researcher can reuse anonymized patient data without re-consent.","research that helps many","control over one's data"),
  ("A parent can spend savings on one child's rare treatment.","saving a child's life","fairness to the other children"),
@@ -2395,6 +3181,273 @@ MORAL_BANK = [
  ("A company can keep selling a safe product in a market that misuses it culturally.","respecting a lawful market","responsibility for foreseeable misuse"),
  ("A teacher can spend limited time on the few failing students or the many average ones.","lifting those most at risk","the greatest total gain"),
  ("A city can name a whistleblower in records requests as the law seems to require.","legal transparency","protecting someone who exposed wrongdoing"),
+ # --- bank extension (2026-07): additional distinct dilemmas across settings ---
+ ("An AI lab can release a capable open model that helps researchers but also lowers the bar for misuse.","open access and scientific progress","preventing foreseeable large-scale harm"),
+ ("A hospital can use a triage algorithm that is more accurate overall but slightly worse for a minority group.","maximizing lives saved across everyone","equal quality of care for every group"),
+ ("A software team can log detailed user sessions to fix bugs faster without asking each user.","shipping a more reliable product","informed consent over personal data"),
+ ("A city can deploy predictive policing that lowers crime but concentrates stops in poorer areas.","reducing overall victimization","fairness and freedom from disproportionate scrutiny"),
+ ("A founder can tell employees the company is fine to prevent panic while quietly seeking a buyer.","protecting jobs by avoiding a run","honesty owed to the people who depend on the firm"),
+ ("A translator can soften a dying patient's blunt words to comfort the family.","kindness to grieving relatives","faithfulness to what the patient actually said"),
+ ("A researcher can exclude an outlier that would weaken a result they believe is genuinely correct.","advancing a likely-true finding","the integrity of reporting all the data"),
+ ("A teacher can quietly give a struggling student extra time on tests without telling the class.","meeting a real individual need","transparency and equal rules for all"),
+ ("A journalist can pay a source for information that would expose serious corruption.","exposing wrongdoing in the public interest","the integrity risk of paid testimony"),
+ ("A game studio can add loot boxes that fund the game but resemble gambling for minors.","funding continued development","protecting young players from exploitative design"),
+ ("A doctor can honor a patient's wish to stop dialysis knowing it will end their life.","respecting autonomy over one's own body","the professional duty to preserve life"),
+ ("A charity can photograph beneficiaries in distress to raise more funds for them.","raising aid that materially helps","the dignity and consent of those depicted"),
+ ("A regulator can approve a cheaper generic drug slightly less consistent than the brand.","broadening access through lower cost","uniform quality assurance for every patient"),
+ ("A manager can assign the best projects to a rising star, starving steady performers of growth.","maximizing the team's output","fair development opportunities for all"),
+ ("A city can use eminent domain to route a rail line through a historic neighborhood.","transit that serves the whole region","the rights and roots of displaced residents"),
+ ("A scientist can accept a fast-tracked review that speeds publication but skips replication.","getting useful results to the field sooner","the reliability that replication protects"),
+ ("A parent can veto a teenager's gender-affirming request pending more time.","cautious protection of a minor","respect for the young person's identity and voice"),
+ ("A bank can deny a loan using a model that is accurate but opaque to the applicant.","sound, data-driven lending","the applicant's right to an explanation"),
+ ("A newsroom can publish a politician's leaked medical records relevant to fitness for office.","the public's interest in a leader's capacity","the individual's medical privacy"),
+ ("A company can keep manufacturing in a region despite lax safety to preserve local jobs.","the livelihoods that depend on the plant","worker safety to a higher standard"),
+ ("A teacher can report a colleague's outdated but not yet harmful teaching methods.","students' long-term learning","loyalty and proportionality toward a peer"),
+ ("A platform can auto-translate hate speech to reach moderators, exposing staff to more of it.","catching harmful content faster","protecting moderators from psychological harm"),
+ ("A city can fluoridate water for public dental health over the objection of some residents.","population-level health benefit","individual consent to medical treatment"),
+ ("A startup can use a competitor's leaked pricing to win a critical deal.","the survival advantage it confers","fair dealing and respect for others' confidential work"),
+ ("A hospital can let a family withhold a terminal diagnosis from an elderly patient.","cultural respect and family wishes","the patient's right to know their condition"),
+ ("A developer can ship an addictive streak feature that boosts learning-app retention.","keeping learners engaged and progressing","not exploiting compulsion loops"),
+ ("A government can release anonymized census microdata useful to researchers but re-identifiable.","the public value of open data","citizens' protection from re-identification"),
+ ("A coach can quietly rest a young athlete against the parents' win-now demands.","the athlete's long-term health","respecting the family's authority and goals"),
+ ("A firm can offer a lower wage to a desperate applicant who would accept it.","a lawful, mutually agreed deal","fairness to someone with weak bargaining power"),
+ ("A doctor can prescribe off-label for a condition with no approved treatment.","a real chance to help a suffering patient","staying within tested, approved uses"),
+ ("A city can install gunshot-detection sensors that also capture ambient conversation.","faster response to violence","residents' privacy from ambient surveillance"),
+ ("A teacher can let a talented but rule-breaking student compete despite a code violation.","rewarding genuine achievement","consistent enforcement of shared rules"),
+ ("A company can quietly patch a security hole without disclosing it was ever exploited.","avoiding panic and reputational harm","affected users' right to know they were exposed"),
+ ("A parent can enroll a child in a clinical trial that mainly benefits future patients.","contributing to cures that help many","the child's own best interest and limited consent"),
+ ("A relief agency can negotiate with an armed group to reach starving civilians.","getting aid to people who will otherwise die","not legitimizing or funding violent actors"),
+ ("A manager can use a personality test that screens out some qualified neurodivergent applicants.","a cheaper, standardized hiring filter","equal opportunity regardless of neurotype"),
+ ("A city can price water higher in drought to force conservation, straining poor households.","protecting a scarce shared resource","affordability of a basic necessity"),
+ ("A scientist can publish a method to edit heritable genes that could cure or be abused.","opening a path to end genetic disease","guarding against irreversible misuse"),
+ ("A company can offer a refund only to customers who complain, keeping quiet ones' money.","a lawful policy that rewards diligence","honest fairness to every affected customer"),
+ ("A doctor can break confidentiality to warn a partner of a serious infectious risk.","preventing foreseeable harm to a third party","the patient's confidentiality and trust"),
+ ("A teacher can grade anonymously, losing context that would help a struggling student.","impartial, bias-free grading","responsiveness to individual circumstances"),
+ ("A firm can automate a warehouse, raising safety and cutting many stable jobs.","fewer injuries and lower prices","the livelihoods of long-serving workers"),
+ ("A city can grant a homeless encampment a sanctioned site near unwilling residents.","shelter and dignity for the unhoused","the concerns of nearby homeowners"),
+ ("A researcher can share code that reproduces results but reveals a collaborator's unpublished idea.","open, reproducible science","credit and consent owed to a collaborator"),
+ ("A parent can let a mature 15-year-old take a gap job abroad against school advice.","the teen's growing autonomy and initiative","protection and the value of finishing school"),
+ ("A platform can down-rank sensational but lawful content to improve discourse.","healthier public conversation","neutral treatment of lawful speech"),
+ ("A doctor can accept a patient's refusal of a blood transfusion on religious grounds.","respect for deeply held belief and autonomy","the duty to prevent an avoidable death"),
+ ("A company can keep a legacy product alive for a few dependent hospitals at a loss.","duty to critical existing users","responsible use of shareholders' capital"),
+ ("A city can ticket jaywalking to cut pedestrian deaths, burdening poorer neighborhoods more.","fewer traffic fatalities","equitable, non-punitive enforcement"),
+ ("A journalist can honor an embargo that delays a safety-relevant story.","trust that keeps sources talking","the public's timely access to safety information"),
+ ("A manager can hire a relative who is genuinely the best candidate.","merit in hiring","the appearance and risk of favoritism"),
+ ("A teacher can use an AI detector that sometimes falsely flags honest students.","deterring and catching cheating","protecting the innocent from false accusations"),
+ ("A company can sell an aging product to a firm that will discontinue support.","a good return for shareholders","continuity for customers who rely on it"),
+ ("A city can require energy retrofits that cut emissions but raise rents.","climate benefit for everyone","affordability for current tenants"),
+ ("A doctor can enroll only English speakers in a trial to simplify consent.","cleaner, faster study logistics","equitable access to research for all groups"),
+ ("A parent can share a child's medical journey online to build a support network.","community and solidarity in hardship","the child's future privacy and consent"),
+ ("A firm can use dynamic pricing that charges loyal customers more than new ones.","revenue that funds the service","fairness to committed customers"),
+ ("A regulator can let a struggling bank hide losses briefly to avoid a panic.","financial stability for depositors","transparency owed to markets and the public"),
+ ("A teacher can let students use calculators, easing frustration but weakening fluency.","reducing anxiety and access barriers","building durable underlying skills"),
+ ("A city can offer tax breaks to keep a major employer, at the cost of school funding.","preserving jobs and the tax base","adequate resources for public education"),
+ ("A researcher can withhold negative trial results a sponsor dislikes.","continued funding for the lab","honest, complete reporting to science"),
+ ("A doctor can give a frightened patient a smaller true risk figure to secure consent.","obtaining consent for a beneficial procedure","full and honest disclosure of risk"),
+ ("A company can require arbitration clauses that quietly limit customers' legal options.","predictable, lower dispute costs","customers' access to the courts"),
+ ("A parent can push a shy child into public performance to build confidence.","fostering growth and resilience","the child's present comfort and consent"),
+ ("A city can adopt facial recognition to speed transit but track riders' movements.","convenience and efficiency for millions","riders' freedom from routine tracking"),
+ ("A teacher can spend a windfall grant on the top students most likely to excel.","maximizing measurable achievement","fairness to those with the greatest need"),
+ ("A firm can meet a diversity target by lowering a bar for one role.","broadening representation and opportunity","uniform standards and fairness to all applicants"),
+ ("A doctor can prioritize a compliant patient over a hostile one with the same need.","smoother, safer clinical care","equal treatment regardless of behavior"),
+ ("A journalist can quote an off-record remark that reveals a major public danger.","warning the public of real risk","the promise implied by going off the record"),
+ ("A company can keep a profitable ad model that tracks children's behavior.","revenue that keeps a free service running","special protection of children's data"),
+ ("A city can clear tents before winter into shelters some residents refuse.","preventing exposure deaths","respecting the autonomy of those who refuse"),
+ ("A researcher can use a captured dataset scraped without clear consent.","a valuable resource for public-good research","the consent and rights of the data subjects"),
+ ("A manager can deny a raise that is fair but would break the team's pay bands.","internal consistency and equity","rewarding one person's genuine contribution"),
+ ("A doctor can recommend a costly test with a small chance of catching a serious disease.","catching a rare but grave condition early","avoiding overtreatment and wasted resources"),
+ ("A teacher can bar a disruptive but curious student from a field trip.","the group's safety and learning","the individual student's inclusion and growth"),
+ ("A firm can green-light a feature that helps most users but excludes those on old devices.","progress for the majority","not stranding users who cannot upgrade"),
+ ("A city can subsidize electric cars, aiding the middle class more than the poor.","accelerating emissions cuts","equitable distribution of public benefit"),
+ ("A parent can accept a scholarship that requires the child to move far from family.","the child's expanded opportunity","family closeness and support"),
+ ("A scientist can co-author with a powerful figure who contributed little, easing publication.","smoothing the path for good work","honest attribution of credit"),
+ ("A company can retain data indefinitely in case it is useful later.","future analytical and safety value","data minimization and users' expectations"),
+ ("A doctor can defer to a hospital cost-control rule that delays a helpful scan.","sustainable, system-wide stewardship","the individual patient's timely care"),
+ ("A teacher can post exemplary student work publicly to inspire others.","celebrating and motivating achievement","the student's consent and privacy"),
+ ("A city can allow a noisy night market that boosts the economy near homes.","local livelihoods and vibrancy","residents' rest and quiet enjoyment"),
+ ("A firm can keep an underperforming employee who is a sole earner supporting a family.","compassion for real hardship","fairness to the team and the business"),
+ ("A researcher can run a deception study that yields insight but misleads participants.","knowledge that can help many","honesty and respect toward participants"),
+ ("A parent can limit a child's screen time strictly against the child's strong wishes.","the child's development and wellbeing","the child's autonomy and trust"),
+ ("A company can comply with a foreign government's data request to keep operating there.","access for millions of users in that market","protecting individual users from state overreach"),
+ ("A doctor can allocate the last ICU bed to a younger patient over an older one of equal need.","expected life-years saved","the equal moral worth of each patient"),
+ ("A teacher can excuse a star athlete's absence that a regular student would be marked for.","supporting a valued representative of the school","consistent rules applied to everyone"),
+ ("A city can permit a data center that brings jobs but strains the local water supply.","economic growth and employment","sustainable use of a shared resource"),
+ ("A firm can quietly A/B test a price increase on unwitting customers.","learning what the market will bear","honest treatment of experimental subjects"),
+ ("A scientist can accept a defense contract that funds basic research with military uses.","resources for open scientific advance","complicity in potential military harm"),
+ ("A parent can refuse a school's request to medicate a restless child.","caution about medicating a young child","the child's ability to learn and belong"),
+ ("A company can offshore data to a cheaper jurisdiction with weaker privacy law.","lower costs that keep the service affordable","stronger protection of user data"),
+ ("A doctor can tell a white lie that a placebo is a strong medicine to help a patient.","the real relief the placebo may bring","the patient's right to truthful care"),
+ ("A city can require businesses to report undocumented workers to enforce labor law.","upholding lawful employment rules","the safety and rootedness of vulnerable workers"),
+ ("A teacher can let a grieving student skip a major exam with no makeup penalty.","compassion in a time of loss","fairness to classmates held to the schedule"),
+ ("A firm can adopt a returns policy that curbs abuse but hurts honest edge cases.","preventing costly fraud","fair treatment of genuine customers"),
+ ("A researcher can publish a security flaw in medical devices already in patients.","warning hospitals and patients to act","not handing attackers a ready exploit"),
+ ("A parent can decline a risky experimental surgery their child's doctors recommend.","avoiding exposing the child to grave risk","following expert medical judgment"),
+ ("A company can use unpaid interns for real work that it cannot otherwise afford.","offering experience and a foot in the door","fair pay for genuine labor"),
+ ("A city can ration a scarce vaccine by lottery rather than by risk.","equal chance and simplicity","directing doses where they save the most lives"),
+ ("A doctor can spend extra unbilled time with one patient, delaying a full waiting room.","attentive care for a patient in need","fairness to everyone else waiting"),
+ ("A teacher can teach a controversial but accurate topic parents object to.","students' access to truthful knowledge","respect for families' values and role"),
+ ("A firm can lay off staff by seniority, protecting veterans but not performance.","loyalty to long-serving employees","retaining those who contribute most now"),
+ ("A city can allow short-term rentals that aid owners but shrink long-term housing.","property owners' freedom and income","affordable housing for residents"),
+ ("A scientist can slow a promising line of work over a small but serious safety doubt.","caution against a low-probability catastrophe","the many who could benefit from progress"),
+ ("A parent can insist a capable adult child repay a loan during the child's hardship.","fairness and the value of keeping promises","compassion for a struggling family member"),
+ ("A company can use a supplier with lower prices but a poor human-rights record.","lower costs that benefit customers","not profiting from others' mistreatment"),
+ ("A doctor can withhold a grim prognosis a patient explicitly said they do not want.","respecting the patient's stated wishes","the value of honest, complete information"),
+ ("A city can build a shelter quickly by waiving normal accessibility standards.","housing people before winter arrives","equal access for disabled residents"),
+ ("A teacher can allow AI writing tools that help some but blur authorship.","access and support for diverse learners","developing and assessing genuine skill"),
+ ("A firm can settle a meritless nuisance suit cheaply rather than fight on principle.","saving money and management time","not rewarding or inviting bad-faith claims"),
+ ("A researcher can anonymize and reuse interview data for a new unrelated study.","extracting more value from hard-won data","the scope of consent participants gave"),
+ ("A parent can move the family for a better job, uprooting a child's friendships.","the family's economic security","the child's stability and social ties"),
+ ("A company can require weekend on-call that strains staff to guarantee uptime.","reliable service customers depend on","employees' rest and personal lives"),
+ # --- bank extension (2026-07, second pass) ---
+ ("A surgeon can attempt a risky operation the patient wants but that the odds disfavor.","respecting the patient's informed choice","the duty not to do likely harm"),
+ ("A librarian can remove a book many find offensive but some deeply value.","shielding the community from harm","intellectual freedom and access"),
+ ("A mayor can cancel a popular festival after a credible but unconfirmed threat.","public safety","civic life and not rewarding fear"),
+ ("A scientist can name a junior who did the key work first, breaking seniority custom.","fair credit for real contribution","institutional norms and mentor relationships"),
+ ("A parent can read a distressed teen's private messages to gauge risk.","protecting a child from harm","the teen's growing privacy"),
+ ("A firm can keep a discriminatory client whose fees fund many jobs.","the livelihoods the contract sustains","refusing to profit from bias"),
+ ("A nurse can sedate an agitated dementia patient for staff and patient safety.","safety and calm on the ward","the patient's autonomy and dignity"),
+ ("A city can seize an abandoned lot for housing over an absent owner's objection.","housing people in need","private property rights"),
+ ("A teacher can override a rubric to reward an unconventional but brilliant answer.","recognizing genuine insight","consistent, transparent grading"),
+ ("A reporter can publish a CEO's private health scare that affects the stock.","investors' right to material information","the individual's medical privacy"),
+ ("A charity can divert emergency funds to a larger crisis elsewhere.","doing the most good overall","the promise made to the first crisis's donors"),
+ ("A developer can release a life-saving app that collects sensitive location data.","the lives the app could save","users' control over intimate data"),
+ ("A coach can cut a loyal veteran for a stronger rookie before finals.","the team's best chance to win","loyalty to years of service"),
+ ("A doctor can enroll unconscious trauma patients in a study without consent.","research that could save future patients","consent and bodily autonomy"),
+ ("A company can watermark AI output to curb misuse, at a cost to legitimate users.","curbing large-scale abuse","convenience and privacy of honest users"),
+ ("A judge can allow illegally obtained evidence that proves a violent crime.","convicting a dangerous offender","the rule barring tainted evidence"),
+ ("A parent can decline a school's gifted track that would separate siblings.","keeping the family close","one child's academic opportunity"),
+ ("A regulator can let a beneficial drug stay on sale despite a rare severe side effect.","the many it helps","protecting the few it could gravely harm"),
+ ("A manager can share a struggling report's diagnosis to explain a deadline slip.","transparency with the team","the employee's medical privacy"),
+ ("A city can use congestion tolls whose revenue funds transit for the poor.","cleaner air and funded transit","the burden on drivers who must commute"),
+ ("A scientist can release a climate model with wide uncertainty that may spur action.","motivating urgent, beneficial action","honesty about what is not yet known"),
+ ("A hospital can move a long-term patient to free a bed for an incoming emergency.","saving a life now at the door","continuity of care for the current patient"),
+ ("A teacher can let a bereaved student retake a test others could not.","compassion for genuine hardship","equal conditions for the class"),
+ ("A firm can adopt AI hiring that is fairer on average but occasionally inscrutable.","reducing human bias overall","each applicant's right to an explanation"),
+ ("A parent can enforce a strict curfew a nearly-adult child bitterly resents.","the child's safety","respecting emerging adult autonomy"),
+ ("A city can relocate a beloved but unsafe playground.","preventing injuries","a cherished community space"),
+ ("A doctor can accept a grateful patient's generous gift.","respect for a sincere gesture","avoiding undue influence and unequal treatment"),
+ ("A journalist can grant anonymity to a source who then makes unverifiable claims.","protecting whistleblowers","accountability to readers for accuracy"),
+ ("A company can localize a product for a market that will use it to restrict speech.","continued service to users in that market","not enabling repression"),
+ ("A parent can accept a scholarship requiring their child to endorse a sponsor.","funding the child's education","the child's independence from commercial pressure"),
+ ("A teacher can fail a plagiarizing student whose visa depends on passing.","upholding academic integrity","the severe personal consequences"),
+ ("A city can fluoride-treat or not, dividing a community that distrusts either choice.","evidence-based public health","respecting deep community disagreement"),
+ ("A manager can enforce a return-to-office rule that hurts caregivers most.","team cohesion and fairness of one rule","the disproportionate burden on caregivers"),
+ ("A doctor can tell a teen's parents about a pregnancy the teen wants kept private.","the parents' role and the teen's welfare","the young patient's confidentiality"),
+ ("A firm can keep selling a product in a country under sanctions to protect local staff.","the jobs and people who depend on it","compliance and not undermining sanctions"),
+ ("A researcher can publish which neighborhoods a disease hits hardest.","targeting help where it is needed","stigma risk to those communities"),
+ ("A parent can let a child gamble small stakes to teach money sense.","a controlled real lesson","not normalizing risky behavior"),
+ ("A city can cap rideshare to protect transit, raising fares for late-night workers.","a sustainable transit system","affordable options for shift workers"),
+ ("A manager can promote from within for morale over a stronger outside hire.","team morale and loyalty","the best person for the role"),
+ ("A doctor can respect a religious family's refusal of a child's transfusion.","the family's beliefs and authority","the child's life and interests"),
+ ("A teacher can teach an accurate history that unsettles national pride.","truthful education","social cohesion and community values"),
+ ("A firm can use a rival's expired patent immediately on expiry.","fair competition and lower prices","goodwill toward a former innovator"),
+ ("A city can install bright lights that cut crime but disturb residents' sleep.","public safety at night","residents' rest and health"),
+ ("A researcher can accept faster results from a lab with questionable animal welfare.","speeding a beneficial discovery","standards for humane treatment"),
+ ("A parent can withhold a terminal diagnosis from a young child.","protecting the child from fear","the child's understanding of their own life"),
+ ("A manager can lay off remote workers first, who are cheaper to replace.","minimizing severance cost","fairness independent of work location"),
+ ("A doctor can prioritize vaccinating a superspreader profession over the frail.","slowing spread to protect many","protecting those at highest personal risk"),
+ ("A city can demolish murals to repair a failing bridge faster.","public safety and cost","cultural heritage"),
+ ("A firm can require unpaid trial work to screen many applicants cheaply.","efficient, broad screening","fair pay for work performed"),
+ ("A teacher can allow noise-canceling aids that help some but isolate them from peers.","individual access and focus","classroom inclusion and shared experience"),
+ ("A researcher can share a dataset that helps science but could deanonymize a few.","broad scientific benefit","the privacy of the vulnerable few"),
+ ("A parent can move a reluctant grandparent into the home for care.","the elder's safety and care","the elder's independence and the family's space"),
+ ("A city can offer amnesty to unlicensed vendors who feed many but dodge rules.","access to affordable food","fair rules and safety inspection"),
+ ("A manager can reveal a whistleblower's identity to comply with a court order.","obeying the law","protecting someone who exposed wrongdoing"),
+ ("A doctor can perform a cosmetic procedure a distressed patient may later regret.","the patient's present wishes","avoiding harm the patient may not foresee"),
+ ("A firm can keep an ambiguous privacy policy that most users never read.","operational and legal flexibility","genuine informed consent"),
+ ("A teacher can spotlight a shy prodigy, risking their comfort for others' inspiration.","inspiring the whole class","the individual student's comfort"),
+ ("A city can build a shelter in a resistant wealthy district.","fair distribution of public burdens","respecting local input and property values"),
+ ("A researcher can decline to retract a flawed paper others still cite usefully.","the useful parts still in use","the integrity of the scientific record"),
+ ("A parent can bar a child from a peer group they deem a bad influence.","protecting the child's development","the child's freedom to choose friends"),
+ ("A manager can automate a beloved receptionist's job, redeploying them elsewhere.","efficiency and the person kept employed","the dignity and fit of their chosen role"),
+ ("A doctor can give scarce ICU care by first-come rather than by prognosis.","simple, equal-queue fairness","saving those most likely to survive"),
+ ("A city can ban single-use plastics, hurting a local factory's workers.","environmental protection","the affected workers' jobs"),
+ ("A firm can keep a top client who mistreats junior staff.","the revenue that funds the firm","protecting employees from abuse"),
+ ("A teacher can grade group work identically despite unequal effort.","cooperation and shared responsibility","fairness to those who did more"),
+ ("A researcher can test a promising therapy on the desperate before full trials.","hope for those out of options","evidence and protection from false hope"),
+ ("A parent can donate a spare kidney to a stranger over family objection.","saving a stranger's life","the family's stake in the parent's health"),
+ ("A city can name streets after a flawed but pivotal historical figure.","recognition of genuine historical impact","the harm that figure also caused"),
+ ("A manager can hide a looming reorganization to keep staff productive.","stability and avoiding premature panic","honesty owed to people planning their lives"),
+ ("A doctor can accept a patient's refusal to disclose a contagious diagnosis to a partner.","the patient's confidentiality","the partner's right to protect themselves"),
+ ("A firm can pay a ransom to recover data and restore service to customers.","restoring service customers depend on","not funding and encouraging extortion"),
+ ("A teacher can let a talented cheater keep a prize if the cheating is unprovable.","not punishing without proof","the integrity of the competition"),
+ ("A city can prioritize repairing roads in high-traffic wealthy areas first.","the greatest reduction in total delay","equal service to neglected neighborhoods"),
+ ("A researcher can coauthor with a controversial funder to enable vital work.","enabling research that helps many","distance from a tainted association"),
+ ("A parent can require a teen to hold a job that crowds out study time.","teaching responsibility and helping the family","the teen's education and future"),
+ ("A manager can reward measurable output, sidelining quiet essential glue work.","rewarding what can be measured","valuing invisible but vital contributions"),
+ ("A doctor can withhold an expensive drug the system cannot sustain for all.","fair, sustainable stewardship","this patient's best available care"),
+ ("A city can allow a data center's jobs despite its heavy power use.","local employment and growth","grid strain and emissions"),
+ ("A firm can enforce a non-compete that limits a departing worker's livelihood.","protecting legitimate business interests","the worker's freedom to earn a living"),
+ ("A teacher can lower a gifted student's grade for a late but superb project.","consistent deadlines for all","rewarding genuine excellence"),
+ ("A researcher can publish a technique that helps conservation and poachers alike.","aiding conservation efforts","not equipping those who would abuse it"),
+ ("A parent can let a child skip a grandparent's wishes to pursue their own path.","the child's self-determination","family bonds and an elder's hopes"),
+ ("A manager can outsource a night shift no local worker will take at legal pay.","filling an essential unmet role","pressure to raise wages instead"),
+ ("A doctor can order a defensive test mainly to avoid a lawsuit.","protecting against liability","avoiding unnecessary cost and risk to the patient"),
+ ("A city can require ID for shelter beds, deterring some of the wary vulnerable.","safety and accountability in shelters","access for those most afraid of authorities"),
+ ("A firm can market a legal supplement whose benefits are weakly evidenced.","offering something customers want","honesty about thin evidence"),
+ ("A teacher can separate close friends to break a disruptive dynamic.","the class's focus and order","the students' valued friendship"),
+ ("A researcher can accept a gag clause to access uniquely valuable industry data.","access to otherwise unavailable data","freedom to publish all findings"),
+ ("A parent can enroll a child in intensive sport that risks long-term injury.","the development of a rare talent","the child's long-term physical health"),
+ ("A manager can deny a promotion to keep a uniquely skilled worker in place.","the team's critical need for their skills","the worker's career advancement"),
+ ("A doctor can honor a living will that conflicts with the family's pleas.","the patient's prior autonomous wishes","the grieving family's anguish"),
+ ("A city can price parking to free curb space, hurting shift workers with cars.","efficient use of scarce curb space","affordability for those who must drive"),
+ ("A firm can retain a legacy insecure system that many small clients still need.","the needs of dependent existing clients","the security risk to everyone"),
+ ("A teacher can enter a struggling student in a contest they will likely lose.","the growth from trying","sparing the student public failure"),
+ ("A researcher can slow-walk a result that would undercut their institute's funding.","the institute's survival and jobs","timely, honest disclosure"),
+ ("A parent can let an anxious child avoid a feared but valuable activity.","the child's present distress","the growth the activity offers"),
+ ("A manager can enforce a dress code that burdens some cultural expression.","a uniform professional standard","respect for cultural and religious expression"),
+ ("A doctor can treat a prisoner ahead of a free patient by clinical need alone.","need-blind medical fairness","public discomfort with the priority"),
+ ("A city can allow a wind farm that aids the climate but harms local birds.","cutting carbon emissions","protecting local wildlife"),
+ ("A firm can keep prices low by using a supplier with unsafe labor conditions.","affordable goods for many","the safety of distant workers"),
+ ("A teacher can excuse an athlete's absences for a scholarship-deciding season.","a life-changing opportunity","equal attendance rules"),
+ ("A researcher can use a convenient but unrepresentative sample to publish sooner.","faster useful findings","the validity and honesty of the claim"),
+ ("A parent can accept a risky bone-marrow donation from one child to save another.","saving the sick child","protecting the donor child from harm"),
+ ("A manager can quietly tolerate minor rule-bending that keeps morale high.","practical morale and flexibility","consistent, fair enforcement"),
+ ("A doctor can decline to treat when personal beliefs conflict, referring onward.","the clinician's conscience","the patient's timely, unobstructed care"),
+ ("A city can host a polluting but high-employment industry in a poorer area.","jobs where they are most needed","environmental justice for the poor"),
+ ("A firm can require staff to use a monitoring tool that also tracks off-hours.","security and productivity","workers' privacy outside work"),
+ ("A teacher can advance a curriculum some parents find morally objectionable.","students' access to full knowledge","parental values and consent"),
+ ("A researcher can prioritize a disease of the rich that funds work on one of the poor.","cross-subsidizing neglected disease","directing effort by need, not funding"),
+ ("A parent can require an adult child to leave home to force independence.","fostering self-reliance","support during a hard transition"),
+ ("A manager can keep a demoralizing but accurate performance ranking public.","transparency and clear incentives","dignity and team trust"),
+ ("A doctor can offer an experimental drug only to those who can travel to the trial.","running a feasible, valid study","equal access regardless of means"),
+ ("A city can bus students to integrate schools, lengthening some commutes.","equal educational opportunity","neighborhood schooling and time"),
+ ("A firm can honor a competitor's recall that also implicates its own product quietly.","consumer safety across the board","competitive and legal self-interest"),
+ ("A teacher can allow a religious exemption from a lesson others must complete.","respect for belief","a common shared curriculum"),
+ ("A researcher can accept authorship credit for securing funding but not doing the work.","the norm that funders are credited","credit tied to actual contribution"),
+ ("A parent can let a teen make a costly mistake to learn from it.","the lasting lesson of consequences","preventing avoidable harm now"),
+ ("A manager can cut a wellness program that few use but some rely on.","reallocating scarce budget","the few who genuinely depend on it"),
+ ("A doctor can enter a do-not-resuscitate note a lucid patient requested but family opposes.","the patient's clear wishes","the family's grief and objection"),
+ ("A city can allow buskers whose music delights some and disturbs others.","public culture and livelihoods","peace for nearby residents and shops"),
+ ("A firm can quietly fix a defect in new units without recalling sold ones.","limiting cost and reputational fallout","fairness to existing owners at risk"),
+ ("A teacher can let a capable student mentor peers instead of advancing alone.","the good done for the class","the student's own faster progress"),
+ ("A researcher can down-weight an inconvenient subgroup result to keep a clean story.","a clear, publishable finding","full and honest reporting"),
+ ("A parent can veto a child's costly passion the family cannot easily afford.","the family's financial stability","the child's cherished pursuit"),
+ ("A manager can require overtime in a crunch that strains parents on the team.","meeting a critical deadline","fairness to those with care duties"),
+ ("A doctor can share anonymized images of a rare case to teach without asking.","training future clinicians","the patient's ownership of their case"),
+ ("A city can grant a stadium tax break projected to spur broad growth.","potential jobs and revenue","fair use of public money for private gain"),
+ ("A firm can keep a founder whose vision drives value but whose conduct harms staff.","the value the founder creates","a safe, respectful workplace"),
+ ("A teacher can push a bright underprivileged student hard, risking burnout.","opening a rare door","the student's wellbeing and pace"),
+ ("A researcher can accept a result that helps their thesis without full replication.","timely completion of the work","the reliability replication provides"),
+ ("A parent can require chores that cut into a child's study or play.","teaching contribution and fairness","the child's time to learn and rest"),
+ ("A manager can favor a candidate who fits the culture over a stronger outsider.","team cohesion","merit and openness to difference"),
+ ("A doctor can withhold antibiotics a patient demands but does not need.","stewardship against resistance","the patient's insistence and comfort"),
+ ("A city can green-light dense housing that strains a quiet neighborhood.","more homes amid a shortage","existing residents' settled expectations"),
+ ("A firm can quietly geo-block a feature to comply with one country's harsh law.","keeping the service legal there","consistent rights for all users"),
+ ("A teacher can report a colleague's leniency that inflates the school's scores.","integrity of the school's record","loyalty and collegiality"),
+ ("A researcher can prioritize a splashy result over a dull but important replication.","attention that draws funding","the science that most needs doing"),
+ ("A parent can override a doctor to try an alternative treatment for their child.","the parent's authority and hope","evidence-based care for the child"),
+ ("A manager can keep a client-facing star who bullies the support team.","the revenue the star brings","protecting the support team"),
+ ("A doctor can allocate a ventilator by daily reassessment, sometimes withdrawing it.","maximizing lives saved over time","the claim of a patient already on it"),
+ ("A city can allow gig-delivery that lowers prices but offloads risk to workers.","cheaper, faster service","fair protection for the workers"),
+ ("A firm can keep a lucrative contract that quietly widens an addictive product's reach.","profit and shareholder duty","not deepening a harmful dependency"),
+ ("A teacher can enforce silence that helps most but harms a student who thinks aloud.","a calm environment for the many","accommodation for a different learner"),
+ ("A researcher can accept industry gifts common in the field but shaping judgment.","field norms and access","independence of scientific judgment"),
+ ("A parent can insist a shy child attend a large family gathering.","family bonds and belonging","the child's comfort and consent"),
+ ("A manager can enforce a policy fairly though it clearly fits one case badly.","predictable, equal rules","fitting the response to the situation"),
+ ("A doctor can recommend hospice when a family wants every last intervention.","comfort and honest prognosis","the family's hope and wishes"),
+ ("A city can fund an arts center or an equivalent expansion of food aid.","enriching community and culture","meeting urgent basic needs"),
+ ("A firm can adopt a four-day week that helps staff but risks client coverage.","employee wellbeing","reliable service to clients"),
 ]
 
 # --------------------------------------------------------------------------
@@ -2502,7 +3555,11 @@ def main():
                 if nr is None: continue
                 errs = validate(nr, "negatives", canon)
                 if errs: raise SystemExit(f"VALIDATION FAIL {nr['id']}: {errs}")
-                new_files.setdefault(f"negatives/{t}.negatives.jsonl", []).append(nr); made_neg += 1
+                neg_rel = f"negatives/{t}.negatives.jsonl"
+                new_files.setdefault(neg_rel, []).append(nr); made_neg += 1
+                # In --replace mode the negatives file must be OVERWRITTEN too, or
+                # stale negatives that point at now-renumbered positive ids linger.
+                if args.replace: replace_files.add(neg_rel)
         report.append((t, args.per_type, produced, n_train, n_eval, made_neg, len(doms)))
 
     # report
@@ -2529,15 +3586,10 @@ def main():
         print("\nDRY RUN - nothing written. Re-run with --write to append.")
         return
     for rel, recs in sorted(new_files.items()):
-        path = os.path.join(data_dir, rel)
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        mode = "w" if rel in replace_files else "a"
-        with open(path, mode) as fh:
-            for r in recs:
-                fh.write(json.dumps(r, ensure_ascii=False) + "\n")
+        write_sharded(data_dir, rel, recs, replace=rel in replace_files)
     if replace_files:
         print("REPLACED (overwritten):", ", ".join(sorted(replace_files)))
-    print(f"\nWROTE {total} records to {data_dir}")
+    print(f"\nWROTE {total} records to {data_dir} (files sharded at {MAX_SHARD_BYTES // (1024*1024)} MiB)")
 
 if __name__ == "__main__":
     main()
