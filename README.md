@@ -39,11 +39,11 @@ Nine types, one recipe file each under [`reasoning-data/reasoning-types/`](reaso
 | metacognitive | process-level |
 | moral-ethical | rubric |
 
-## Current corpus
+## Breadth and depth
 
-`reasoning-data/data/` holds **1,300 curated examples per type** (1,040 train / 260 eval, 11,700 total) plus **1,241 paired negatives** for the verifiable types, spanning many domains and several distinct question formats per type.
+The corpus is an ongoing, growing effort. It spans all nine reasoning types, each drawn across many subject-matter domains and several distinct question formats, so the model learns the underlying operation rather than a single phrasing. Every type carries a train / eval split, and the verifiable types are paired with contrastive negatives.
 
-The verifiable types (deductive, inductive, probabilistic, counterfactual, causal) were checked by executing their verifier. The rubric / ranking types (abductive, analogical, moral-ethical) are template-authored with their verification method recorded, awaiting an independent solver / judge pass.
+The verifiable types (deductive, inductive, probabilistic, counterfactual, causal) are checked by executing their verifier. The rubric / ranking types (abductive, analogical, moral-ethical) are template-authored with their verification method recorded, awaiting an independent solver / judge pass. See [`reasoning-data/README.md`](reasoning-data/README.md) for current status.
 
 ## Repository layout
 
