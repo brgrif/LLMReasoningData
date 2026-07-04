@@ -1,6 +1,21 @@
 # tools/
 
-Reusable tooling for the corpus. Currently one script.
+Reusable tooling for the corpus.
+
+- `generate.py` — procedural/parametric batch generator (verifiable types are
+  executed and checked). Documented below.
+- `deal_season.py` — the GENERATOR.md dealer. Shuffles the season decks and
+  deals one spec per item across the nine diversity dimensions, enforcing the
+  composition targets, the no-consecutive-repeat rule, the per-domain cap, and
+  the isomorphism quota. Emits `specs.json` (`{"salt":.., "items":[..]}`) that
+  drives the authoring pass. Change the decks in the file to launch a new
+  season; the run salt is drawn fresh each run. `python deal_season.py specs.json`
+- `validate_batch.py` — validates an authored GENERATOR.md batch against
+  SCHEMA.md and its dealt specs, scans the season ban list, and runs the
+  end-of-batch near-duplicate self-audit. `python validate_batch.py specs.json
+  data/raw/'*.raw.jsonl'`. Exits non-zero on any record error.
+
+## generate.py
 
 ## generate.py
 
