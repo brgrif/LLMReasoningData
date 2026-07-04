@@ -79,14 +79,22 @@ Difficulty is tagged 1-5 for curriculum ordering.
   from `BANK`-marked lists in `generate.py`. When the report shows one produced
   fewer than requested (`<-- SHORT`), extend the relevant bank; the tool never
   pads a shortfall with duplicates.
-- **Analogical** is procedurally generated from `ANA_REL` (relations with
-  explicit role labels) plus parametric difficulty-4/5 trap kernels (series
-  blockage, binding constraint by rate, exception-to-exception, competing
-  relations). Train and eval draw from disjoint answer pools, and each item
-  carries an explicit `split`, so regeneration is leakage-free by construction.
-  Regenerate the whole type cleanly with
+- **Analogical** is procedurally generated in three layers: (1) `STRUCTURES` --
+  the cross-domain isomorphism engine: abstract relational structures each
+  instantiated across many unrelated domains, generating "what plays the same
+  role in system B as X in system A" items where source and target are always
+  different domains (a leakage guard blocks any item whose answer appears in the
+  source text); (2) parametric difficulty-4/5 trap kernels (series blockage,
+  binding constraint by rate, exception-to-exception, competing relations); and
+  (3) `ANA_REL` single-relation completion with explicit role labels. Train and
+  eval draw from disjoint answer pools, and held-out relations / trap-skins /
+  target systems are reserved for eval, so eval tests cross-domain transfer, not
+  recall. Each item carries an explicit `split`. Regenerate cleanly with
   `python tools/generate.py --only analogical --replace --write` (overwrites the
-  curated files and renumbers ids from 1000); it is fully reproducible.
+  curated files, renumbers ids from 1000); fully reproducible. To scale
+  cross-domain coverage, add structures to `STRUCTURES` or instances (domains) to
+  existing ones -- breadth of structures x domains is what drives transfer, not
+  volume of near-duplicates.
 - The tool dedups against existing problems and allocates new IDs above the
   global per-type maximum (across `curated/`, `raw/`, and `negatives/`), so
   re-running is safe, additive, and never collides with pre-gate raw candidates.

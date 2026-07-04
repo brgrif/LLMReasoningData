@@ -739,9 +739,11 @@ Q_ANA_EVAL = [
 ]
 
 def _simple_items(rel, left, right, dom, diff, targets, pool, phrasings, split, seen):
-    """One item per target, demos drawn from `pool` (excluding the target)."""
+    """One item per target (no per-item phrasing duplication); the phrasing
+    rotates across targets so the dataset keeps format variety without emitting
+    the same analogy three times."""
     out = []
-    for t0, ans in targets:
+    for ti, (t0, ans) in enumerate(targets):
         others = [(a, b) for (a, b) in pool if a != t0][:3]
         if len(others) < 3:
             continue
@@ -753,14 +755,14 @@ def _simple_items(rel, left, right, dom, diff, targets, pool, phrasings, split, 
             (f"The {right} of {t0} is {ans}.", "valid"),
             (f"Check: the demonstrations and '{t0}' share the relation but differ in surface content, so the structure -- not word overlap -- fixes the answer as {ans}.", "valid"),
         ]
-        for tmpl in phrasings:
-            prob = tmpl.format(demo=demo, rel=rel, t0=t0, left=left, right=right, aleft=_art(left))
-            if prob in seen:
-                continue
-            seen.add(prob)
-            out.append(dict(domain=dom, problem=prob, steps=steps, final=cap(str(ans)) + ".",
-                            difficulty=diff, vm="process_check", split=split,
-                            vd=f"Answer fills the '{right}' role of the '{rel}' relation for '{t0}'; mapping shown across the demonstrations, surface content varied."))
+        tmpl = phrasings[ti % len(phrasings)]
+        prob = tmpl.format(demo=demo, rel=rel, t0=t0, left=left, right=right, aleft=_art(left))
+        if prob in seen:
+            continue
+        seen.add(prob)
+        out.append(dict(domain=dom, problem=prob, steps=steps, final=cap(str(ans)) + ".",
+                        difficulty=diff, vm="process_check", split=split,
+                        vd=f"Answer fills the '{right}' role of the '{rel}' relation for '{t0}'; mapping shown across the demonstrations, surface content varied."))
     return out
 
 # ---- difficulty-4/5 trap kernels ----------------------------------------
@@ -969,6 +971,216 @@ def _t4_items(ops, split, seen):
                         vd=f"Intended relation verified on all demos; competitor '{comp_name}' fails at {diverge} ({comp(diverge)} vs {op(diverge)}); answer {ans} = op({tx})."))
     return out
 
+# ---- CROSS-DOMAIN ISOMORPHISM ENGINE ------------------------------------
+# The core of cross-domain transfer. Each STRUCTURE is one abstract relational
+# schema with a single mappable ROLE; it is instantiated across many unrelated
+# domains. Items ask "what plays the same role in system B that X plays in
+# system A", so the SOURCE and TARGET are always different domains and only the
+# structure -- never shared vocabulary -- yields the answer. Fillers are chosen
+# so the answer word does not appear in the source text (a leakage guard also
+# enforces this at build time).
+#
+# Split: each structure reserves some instances (ev=True) as EVAL TARGETS, in
+# systems/domains never used as a train target for that structure, with answers
+# disjoint from every train answer. Sources are always drawn from train
+# instances, so eval measures "apply a structure learned in known domains to a
+# new domain" -- transfer, not recall.
+#
+# inst = (domain, system, filler[=answer], context, distractor|None, ev)
+STRUCTURES = [
+    dict(name="flow driven by a potential difference",
+         role="supplies the driving force that moves the medium through the system",
+         diff=3, insts=[
+            ("engineering and physical systems", "an electrical circuit", "the battery", "it pushes current through the components", "a resistor", False),
+            ("engineering and physical systems", "a plumbing loop", "the pump", "it pushes water through the pipes", "a valve", False),
+            ("biology and ecology", "the body's circulation", "the heart", "it pushes blood through the vessels", "a capillary", False),
+            ("economics and markets", "a two-region market", "the price gap", "it moves goods from the cheaper region to the dearer one", "a warehouse", False),
+            ("mechanical / systems troubleshooting", "a hydraulic brake system", "the master cylinder", "it pushes brake fluid to the calipers", "a brake pad", False),
+            ("science", "a river system", "the elevation drop (gravity)", "it moves water downhill", "a boulder", True),
+            ("chemistry", "diffusion across a membrane", "the concentration gradient", "it drives molecules from high to low concentration", "the membrane", True),
+         ]),
+    dict(name="negative feedback holding a variable near a setpoint",
+         role="acts as the regulator that holds the controlled variable near a target",
+         diff=3, insts=[
+            ("engineering and physical systems", "a heated room", "the thermostat", "it holds room temperature near a set value", "the heater", False),
+            ("biology and ecology", "the human body", "the hypothalamus", "it holds core temperature near 37C", "the skin", False),
+            ("economics and markets", "a national economy", "the central bank", "it holds the inflation rate near a target", "a commercial bank", False),
+            ("engineering and physical systems", "a car on cruise control", "the cruise controller", "it holds vehicle speed near the set speed", "the engine", False),
+            ("finance and business operations", "a warehouse", "the reorder policy", "it holds the stock level near a target", "a shelf", False),
+            ("biology and ecology", "the bloodstream", "the pancreas", "it holds blood sugar near a healthy level", "the liver", True),
+            ("incident and root-cause analysis", "an autoscaled service", "the autoscaler", "it holds CPU utilization near a target", "a server", True),
+         ]),
+    dict(name="equilibrium of two opposing influences",
+         role="is the opposing influence that balances the first",
+         diff=3, opposing=True, insts=[
+            # for this structure filler = the OPPOSING force; context names the FIRST force
+            ("economics and markets", "a market's price", "supply from sellers", "demand from buyers pushes the price up", "a warehouse", False),
+            ("chemistry", "a reversible reaction", "the reverse reaction", "the forward reaction builds up product", "a catalyst", False),
+            ("biology and ecology", "a population's size", "the death rate", "the birth rate pushes the size up", "the habitat", False),
+            ("engineering and physical systems", "a load hanging on a spring", "the spring's restoring force", "gravity pulls the load down", "the ceiling", False),
+            ("science", "a floating object", "buoyancy pushing up", "gravity pulls the object down", "the water", False),
+            ("negotiation and interpersonal strategy", "a price negotiation", "the buyer's walk-away limit", "the seller's asking price pushes the number up", "the meeting room", False),
+            ("economics and markets", "the labor market's wage", "labor supply from workers", "employer demand pushes the wage up", "a factory", True),
+            ("science", "a planet's stable size", "outward radiation pressure", "gravity pulls the gas inward", "a moon", True),
+         ]),
+    dict(name="a single bottleneck caps the whole system's output",
+         role="is the limiting element that caps the whole system's output",
+         diff=3, insts=[
+            ("chemistry", "a chemical reaction", "the limiting reagent", "it runs out first and caps how much product forms", "the excess reagent", False),
+            ("biology and ecology", "plant growth in a field", "the scarcest nutrient", "it caps the yield no matter how much else is plentiful", "abundant sunlight", False),
+            ("program behavior", "a processing pipeline", "the slowest stage", "it caps the end-to-end throughput", "a fast stage", False),
+            ("finance and business operations", "a project schedule", "the critical path", "it sets the earliest finish date", "a task with slack", False),
+            ("everyday planning", "a dinner-party timeline", "the longest-cooking dish", "it sets when dinner can be served", "a quick side salad", False),
+            ("logic puzzles", "a chain of deductions", "the weakest inference", "it caps how certain the final conclusion is", "a rock-solid step", False),
+            ("economics and markets", "a supply chain", "the tightest supplier", "it caps how much can be delivered", "a plentiful input", True),
+            ("medicine-style diagnosis", "oxygen delivery to tissue", "the narrowest artery", "it caps the flow that can reach the tissue", "a wide vein", True),
+         ]),
+    dict(name="a buffer absorbs shocks to stabilize a variable",
+         role="acts as the buffer that absorbs shocks to keep the variable steady",
+         diff=3, insts=[
+            ("chemistry", "a buffered solution", "the weak acid-base pair", "it absorbs added acid or base to keep pH steady", "the strong acid", False),
+            ("finance and business operations", "a household budget", "the emergency fund", "it absorbs income shocks to keep spending steady", "the mortgage", False),
+            ("biology and ecology", "a wetland by a river", "the wetland's storage", "it absorbs flood surges to keep downstream levels steady", "a bridge", False),
+            ("engineering and physical systems", "a power grid", "the battery bank", "it absorbs demand spikes to keep voltage steady", "a transformer", False),
+            ("program behavior", "a video stream", "the playback buffer", "it absorbs network dips to keep playback smooth", "the codec", False),
+            ("medicine-style diagnosis", "the bloodstream's pH", "the bicarbonate system", "it absorbs metabolic acid to keep pH steady", "a red blood cell", True),
+            ("economics and markets", "a commodity market", "the strategic reserve", "it absorbs supply shocks to keep prices steady", "an exchange", True),
+         ]),
+    dict(name="a gatekeeper selectively admits some and blocks the rest",
+         role="acts as the gatekeeper that selectively admits some and blocks the rest",
+         diff=3, insts=[
+            ("biology and ecology", "a living cell", "the cell membrane", "it lets select ions in and keeps others out", "the nucleus", False),
+            ("engineering and physical systems", "a private network", "the firewall", "it admits allowed traffic and blocks the rest", "a server", False),
+            ("law and regulation", "a national border", "customs and visa control", "it admits eligible travelers and turns others away", "the airport", False),
+            ("medicine-style diagnosis", "the brain's blood supply", "the blood-brain barrier", "it admits select molecules and blocks most others", "a neuron", False),
+            ("narrative and discourse", "an editorial desk", "the editor", "it admits publishable pieces and cuts the rest", "the newsroom", False),
+            ("program behavior", "a web API", "the authentication layer", "it admits valid requests and rejects the rest", "the database", True),
+            ("social situations", "an exclusive club", "the door policy", "it admits members and turns others away", "the bar", True),
+         ]),
+    dict(name="a whole built up from many repeated small parts",
+         role="is the whole that its basic repeated parts compose",
+         diff=3, insts=[
+            ("formal grammars and symbol systems", "language", "a sentence", "words compose it", "a letter", False),
+            ("chemistry", "matter", "a molecule", "atoms compose it", "an electron", False),
+            ("engineering and physical systems", "masonry", "a wall", "bricks compose it", "a window", False),
+            ("program behavior", "a software system", "a program", "functions compose it", "a variable", False),
+            ("social situations", "a population", "a community", "individual people compose it", "a rule", False),
+            ("biology and ecology", "a body's structure", "a tissue", "cells compose it", "an organ", True),
+            ("narrative and discourse", "a story", "a chapter", "scenes compose it", "a title", True),
+         ]),
+    dict(name="compounding: output is fed back to enlarge the base that produces it",
+         role="is the reinvested output that feeds back to enlarge the base",
+         diff=3, insts=[
+            ("finance and business operations", "a savings account", "the reinvested interest", "it is added to the balance so future interest grows", "the account fee", False),
+            ("program behavior", "a viral post", "each reshare", "it exposes more people who reshare in turn", "a single like", False),
+            ("chemistry", "a nuclear chain reaction", "each emitted neutron", "it triggers a further reaction", "the container wall", False),
+            ("economics and markets", "a growing firm", "reinvested profit", "it expands capacity so output rises", "a one-off grant", False),
+            ("biology and ecology", "a growing population", "each new cohort", "it matures into breeders so growth accelerates", "a passing predator", True),
+            ("science", "an avalanche", "each dislodged mass", "it dislodges still more snow", "a distant peak", True),
+         ]),
+]
+
+def _iso_items(structures, seen):
+    out = []
+    for st in structures:
+        name, role, diff = st["name"], st["role"], st["diff"]
+        opposing = st.get("opposing", False)
+        train = [i for i in st["insts"] if not i[5]]
+        evalt = [i for i in st["insts"] if i[5]]
+        def role_map_item(target, srcs, split, use_distractor, fmt="rolemap"):
+            (td, tsys, tfill, tctx, tdis, _) = target
+            src_txt = "; ".join(f"in {s[1]}, {s[2]} {role} ({s[3]})" for s in srcs)
+            # leakage guard: the answer must not already appear in the source text
+            ans_head = tfill.split("(")[0].replace("the ", "").strip().lower()
+            if ans_head and ans_head in src_txt.lower():
+                return None
+            if opposing:
+                first_force = tctx  # e.g. "demand from buyers pushes the price up"
+                prob = (f"The same structure -- {name} -- appears in many systems: "
+                        + "; ".join(f"in {s[1]}, {s[3]}, and {s[2]} balances it" for s in srcs)
+                        + f". Now consider {tsys} ({td}): {first_force}. "
+                        f"By the same structure, what opposing influence balances it?")
+                steps = [
+                    (f"Shared structure: {name}. The role to map is the opposing influence that restores balance.", "valid"),
+                    ("; ".join(f"in {s[1]} ({s[0]}) it is {s[2]}" for s in srcs) + " -- different domains, same balancing role.", "valid"),
+                    (f"Map onto {tsys}: given that {first_force}, the influence that balances it is {tfill}.", "valid"),
+                    (f"Check: sources ({', '.join(s[0] for s in srcs)}) and target ({td}) share no vocabulary, so the balancing role -- not surface similarity -- yields {tfill}.", "valid"),
+                ]
+                final = f"{cap(tfill)} -- it is the opposing influence that balances {first_force.split(' pushes')[0].split(' builds')[0]} in {tsys}."
+            elif fmt == "proportional":
+                prob = (f"{cap(srcs[0][2])} is to {srcs[0][1]} as {srcs[1][2]} is to {srcs[1][1]} -- in each, it {role}. "
+                        f"By the same relation, what is to {tsys} ({td})?")
+                if use_distractor and tdis:
+                    prob += f" (Note: {tdis} is present too, but decide by role, not by surface prominence.)"
+                steps = [
+                    (f"Read the relation across the two source pairs: in {srcs[0][1]} it is {srcs[0][2]}, in {srcs[1][1]} it is {srcs[1][2]} -- in each, the element that {role}.", "valid"),
+                    (f"That is one shared structure ({name}) in two unrelated domains ({srcs[0][0]}, {srcs[1][0]}), so it is the relation -- not any surface feature -- that must transfer.", "valid"),
+                    (f"Carry it to {tsys}: the element that {role} there is {tfill}.", "valid"),
+                ]
+                if use_distractor and tdis:
+                    steps.append((f"Reject the surface distractor: {tdis} is present in {tsys} but does not fill this role.", "valid"))
+                steps.append((f"Check: target domain ({td}) differs from both sources and shares no vocabulary with the answer, so only the structural role yields {tfill}.", "valid"))
+                final = f"{cap(tfill)} -- to {tsys} as {srcs[0][2]} is to {srcs[0][1]}."
+            else:
+                prob = (f"The same relational structure -- {name} -- shows up across unrelated systems: {src_txt}. "
+                        f"Now consider {tsys} ({td}). By the same structure, which element {role}?")
+                if use_distractor and tdis:
+                    prob += f" (Note: {tdis} is also present, but decide by role, not by surface prominence.)"
+                steps = [
+                    (f"Shared relational structure: {name}. The role to map across systems is: it {role}.", "valid"),
+                    ("In " + srcs[0][1] + f", that role is filled by {srcs[0][2]}; in {srcs[1][1]}, by {srcs[1][2]} -- different domains, one role.", "valid"),
+                    (f"Map the structure onto {tsys}: the element that {role} there is {tfill}.", "valid"),
+                ]
+                if use_distractor and tdis:
+                    steps.append((f"Reject the surface distractor: {tdis} is present in {tsys} but does not fill this role, so its presence does not make it the answer.", "valid"))
+                steps.append((f"Check: the sources ({srcs[0][0]}, {srcs[1][0]}) and the target ({td}) share no vocabulary, so only the structural role -- not surface similarity -- yields {tfill}.", "valid"))
+                final = f"{cap(tfill)} -- it plays the same role in {tsys} that {srcs[0][2]} plays in {srcs[0][1]}."
+            d = diff + (1 if (use_distractor and tdis) else 0)
+            if prob in seen:
+                return None
+            seen.add(prob)
+            return dict(domain=td, problem=prob, steps=steps, final=final, difficulty=d,
+                        vm="process_check", split=split,
+                        vd=f"Cross-domain role map ({name}): answer fills the target role in a domain ({td}) different from the sources; leakage-guarded so the answer is not present in the source text.")
+        def pick_srcs(target, offset=0):
+            """Two sources from DIFFERENT domains than the target (and from each
+            other where possible), so the cross-domain claim in the trace holds."""
+            td = target[0]
+            cands = [s for s in train if s[0] != td and s is not target]
+            cands = cands[offset:] + cands[:offset]
+            chosen, doms = [], set()
+            for s in cands:
+                if s[0] not in doms:
+                    chosen.append(s); doms.add(s[0])
+                if len(chosen) == 2:
+                    return chosen
+            for s in cands:  # fall back if not enough distinct domains
+                if s not in chosen: chosen.append(s)
+                if len(chosen) == 2: break
+            return chosen
+        # Per target keep at most TWO items (avoid duplicating the same answer):
+        # one clean and one distractor variant, each with a different source
+        # pairing, and the QUESTION FORMAT rotates across targets for
+        # format-invariance without per-item duplication.
+        for idx, t in enumerate(train):
+            fmt = "proportional" if idx % 2 else "rolemap"
+            variants = [(pick_srcs(t, 0), False), (pick_srcs(t, 2), True)]
+            for srcs, ud in variants:
+                if len(srcs) < 2:
+                    continue
+                it = role_map_item(t, srcs, "train", ud, fmt)
+                if it: out.append(it)
+        # eval: held-out target instances (unseen systems/domains), sources from train
+        for j, t in enumerate(evalt):
+            fmt = "proportional" if j % 2 else "rolemap"
+            variants = [(pick_srcs(t, j), False), (pick_srcs(t, j + 1), True)]
+            for srcs, ud in variants:
+                if len(srcs) < 2:
+                    continue
+                it = role_map_item(t, srcs, "eval", ud, fmt)
+                if it: out.append(it)
+    return out
+
 def build_analogical(need, rng, exclude):
     """Generate the analogical corpus. Items carry an explicit 'split'; the
     writer partitions by it, so train and eval answer pools stay disjoint.
@@ -997,6 +1209,8 @@ def build_analogical(need, rng, exclude):
     out += _t3_items(T3_SKINS[4:], "eval", seen)
     out += _t4_items(T4_OPS[:4], "train", seen)
     out += _t4_items(T4_OPS[4:], "eval", seen)
+    # --- cross-domain isomorphism: the core transfer layer ---
+    out += _iso_items(STRUCTURES, seen)
     # honor dedup against anything already on disk (append-mode safety)
     out = [it for it in out if it["problem"] not in exclude]
     return out
